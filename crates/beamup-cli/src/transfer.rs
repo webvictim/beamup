@@ -149,7 +149,9 @@ async fn push_file(
             compressed.len()
         );
 
-        let tmp_dir = std::env::temp_dir().join("beamup-chunks");
+        // Use a unique temp dir per file to avoid collisions
+        let file_id = format!("{:x}", beamup_protocol::hash::hash_content(remote_path.as_bytes()));
+        let tmp_dir = std::env::temp_dir().join(format!("beamup-chunks-{file_id}"));
         std::fs::create_dir_all(&tmp_dir)?;
 
         // Write chunks to local temp files and scp them in parallel
@@ -205,6 +207,9 @@ async fn push_file(
             &["/tmp/beamup-agent", "--decompress", &format!("{remote_path}.beamup-lz4"), remote_path],
         )
         .await?;
+
+        // Clean up local temp dir
+        let _ = std::fs::remove_dir_all(&tmp_dir);
 
         debug!("pushed (chunked): {} ({num_chunks} chunks)", local_path.display());
     }

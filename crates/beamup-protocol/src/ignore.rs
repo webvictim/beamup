@@ -33,8 +33,11 @@ impl IgnoreRules {
         // Always ignore .git directory and beamup internals
         let mut builder = GitignoreBuilder::new(root);
         let _ = builder.add_line(None, ".git");
-        let _ = builder.add_line(None, ".beamup-tmp");
         let _ = builder.add_line(None, "*.beamup-tmp");
+        let _ = builder.add_line(None, "*.beamup-chunk-*");
+        let _ = builder.add_line(None, "*.beamup-lz4");
+        let _ = builder.add_line(None, "*.beamup-lz4-chunk-*");
+        let _ = builder.add_line(None, "*.beamup-chunk-tmp");
         if let Ok(gi) = builder.build() {
             rules.push(gi);
         }

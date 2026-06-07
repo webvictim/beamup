@@ -5,7 +5,7 @@ use anyhow::Result;
 use beamup_protocol::compress::{self, CHUNKED_THRESHOLD};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::beam::Beam;
 
@@ -175,21 +175,18 @@ async fn push_file(
             handle.await??;
         }
 
-        // Reassemble on the beam: cat chunks > compressed file, then decompress via agent
-        // We use the agent's built-in reassembly by telling it the file is ready
-        // But first, concatenate the chunks on the beam
+        // Reassemble on the beam: cat chunks into compressed file, then decompress via agent
         let mut cat_cmd = String::from("cat");
         for i in 0..num_chunks {
             cat_cmd.push_str(&format!(" '{remote_path}.beamup-chunk-{i:04}'"));
         }
         cat_cmd.push_str(&format!(" > '{remote_path}.beamup-lz4'"));
-        // Then clean up chunks
         cat_cmd.push_str(" && rm -f");
         for i in 0..num_chunks {
             cat_cmd.push_str(&format!(" '{remote_path}.beamup-chunk-{i:04}'"));
         }
 
-        Beam::exec_cmd(beam_id, &["sh", "-c", &cat_cmd]).await?;
+        Beam::exec_shell(beam_id, &cat_cmd).await?;
 
         // Decompress on the beam using the agent's beamup-decompress helper
         // Since we can't rely on lz4 being installed, we use a simple approach:
@@ -296,7 +293,9 @@ async fn pull_file(
     Ok(())
 }
 
-/// Deploy the agent binary using chunked parallel transfer
+/// Deploy the agent binary using chunked parallel transfer (no compression —
+/// the agent isn't available yet to decompress, and raw chunked parallel scp
+/// is already much faster than a single serial transfer).
 pub async fn deploy_agent_chunked(
     beam_id: &str,
     agent_path: &Path,
@@ -304,20 +303,12 @@ pub async fn deploy_agent_chunked(
 ) -> Result<()> {
     let data = std::fs::read(agent_path)?;
     let size = data.len();
-
-    let compressed = compress::compress(&data);
-    let chunks = compress::split_chunks(&compressed);
+    let chunks = compress::split_chunks(&data);
     let num_chunks = chunks.len();
 
-    info!(
-        "deploying agent: {} bytes → {} compressed, {} chunks",
-        size,
-        compressed.len(),
-        num_chunks,
-    );
+    info!("deploying agent: {size} bytes, {num_chunks} chunks");
 
     if num_chunks <= 1 {
-        // Small enough for single scp
         Beam::scp_to_beam(beam_id, agent_path, "/tmp/beamup-agent").await?;
         Beam::exec_cmd(beam_id, &["chmod", "+x", "/tmp/beamup-agent"]).await?;
         return Ok(());
@@ -328,7 +319,6 @@ pub async fn deploy_agent_chunked(
 
     let sem = Arc::new(Semaphore::new(concurrency));
 
-    // Write chunks and scp in parallel
     let mut handles = Vec::with_capacity(num_chunks);
     for (i, chunk) in chunks.into_iter().enumerate() {
         let chunk_local = tmp_dir.join(format!("agent_chunk_{i:04}"));
@@ -350,55 +340,19 @@ pub async fn deploy_agent_chunked(
         handle.await??;
     }
 
-    // Reassemble on beam: cat chunks > compressed, then decompress
-    // Since the agent isn't running yet, we use python3 (available on beam) for lz4 decompression
-    // Actually, let's use a simpler approach: cat chunks into one file, then use a tiny inline
-    // python script to decompress lz4 (lz4_flex prepend-size format)
+    // Reassemble on beam with cat
     let mut cat_cmd = String::from("cat");
     for i in 0..num_chunks {
         cat_cmd.push_str(&format!(" /tmp/beamup-agent.chunk-{i:04}"));
     }
-    cat_cmd.push_str(" > /tmp/beamup-agent.lz4");
-    cat_cmd.push_str(" && rm -f");
+    cat_cmd.push_str(" > /tmp/beamup-agent && rm -f");
     for i in 0..num_chunks {
         cat_cmd.push_str(&format!(" /tmp/beamup-agent.chunk-{i:04}"));
     }
 
-    Beam::exec_cmd(beam_id, &["sh", "-c", &cat_cmd]).await?;
-
-    // Decompress using python3 (available on beam) — lz4_flex prepend-size format:
-    // first 4 bytes (little-endian) = uncompressed size, rest = lz4 block
-    let decompress_script = r#"
-import struct, lz4.block, sys
-with open('/tmp/beamup-agent.lz4', 'rb') as f:
-    data = f.read()
-size = struct.unpack('<I', data[:4])[0]
-decompressed = lz4.block.decompress(data[4:], uncompressed_size=size)
-with open('/tmp/beamup-agent', 'wb') as f:
-    f.write(decompressed)
-"#;
-
-    // Try python lz4 first; if not available, fall back to shipping a small decompressor
-    let py_result = Beam::exec_cmd(
-        beam_id,
-        &["python3", "-c", decompress_script],
-    )
-    .await;
-
-    if py_result.is_err() {
-        // Fallback: install lz4 python module and retry, or use a different approach
-        // Since python3-lz4 may not be installed, let's use a simpler decompression:
-        // scp a tiny static decompressor, or just scp the uncompressed binary as single file
-        warn!("python3-lz4 not available, falling back to single scp for agent deploy");
-        // Clean up and re-do with single scp
-        let _ = Beam::exec_cmd(beam_id, &["rm", "-f", "/tmp/beamup-agent.lz4"]).await;
-        Beam::scp_to_beam(beam_id, agent_path, "/tmp/beamup-agent").await?;
-    } else {
-        // Clean up
-        let _ = Beam::exec_cmd(beam_id, &["rm", "-f", "/tmp/beamup-agent.lz4"]).await;
-    }
-
+    Beam::exec_shell(beam_id, &cat_cmd).await?;
     Beam::exec_cmd(beam_id, &["chmod", "+x", "/tmp/beamup-agent"]).await?;
+
     info!("agent deployed ({num_chunks} chunks)");
     Ok(())
 }

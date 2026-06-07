@@ -193,6 +193,24 @@ impl Beam {
         Ok(())
     }
 
+    /// Run a shell command string in the beam (handles redirects, pipes, etc.)
+    pub async fn exec_shell(beam_id: &str, shell_cmd: &str) -> Result<()> {
+        let output = Command::new("tsh")
+            .args(["beams", "exec", beam_id, "--", "bash", "-c", shell_cmd])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("failed to exec shell in beam")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("shell exec failed: {stderr}");
+        }
+
+        Ok(())
+    }
+
     /// Run a non-interactive command in the beam (no output captured)
     pub async fn exec_cmd(beam_id: &str, cmd: &[&str]) -> Result<()> {
         let mut args = vec!["beams", "exec", beam_id, "--"];

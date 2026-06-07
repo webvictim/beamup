@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,6 +35,7 @@ pub struct SyncEngine {
     ignore_rules: IgnoreRules,
     file_states: HashMap<String, FileState>,
     suppress_set: HashMap<String, Instant>,
+    in_flight: HashSet<String>,
 }
 
 impl SyncEngine {
@@ -67,6 +68,7 @@ impl SyncEngine {
             ignore_rules,
             file_states: HashMap::new(),
             suppress_set: HashMap::new(),
+            in_flight: HashSet::new(),
         })
     }
 
@@ -304,8 +306,9 @@ impl SyncEngine {
                 if needs_content {
                     if size <= INLINE_THRESHOLD {
                         // Agent will send inline — nothing to do, it'll arrive as FileContent
-                    } else {
+                    } else if !self.in_flight.contains(&path) {
                         // Pull via scp
+                        self.in_flight.insert(path.clone());
                         self.transfer_pool.pull(path);
                     }
                 }
@@ -399,8 +402,9 @@ impl SyncEngine {
                             data,
                         })
                         .await?;
-                } else {
+                } else if !self.in_flight.contains(&rel_str) {
                     // Notify agent of change, then push via scp
+                    self.in_flight.insert(rel_str.clone());
                     self.transport
                         .send(Message::FileChanged {
                             path: rel_str.clone(),
@@ -458,6 +462,8 @@ impl SyncEngine {
         &mut self,
         result: crate::transfer::TransferResult,
     ) -> Result<()> {
+        self.in_flight.remove(&result.path);
+
         if !result.success {
             warn!("transfer failed: {} — {:?}", result.path, result.error);
             return Ok(());

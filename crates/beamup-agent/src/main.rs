@@ -31,9 +31,14 @@ struct Args {
     #[arg(long)]
     compress: Option<PathBuf>,
 
-    /// Output path for decompress mode (positional after --decompress)
+    /// Decompress chunked files: --decompress-chunks <output-path> <num-chunks>
+    /// Reads <output-path>.beamup-chunk-NNNN files, decompresses each, writes concatenated output.
+    #[arg(long)]
+    decompress_chunks: Option<PathBuf>,
+
+    /// Output path for decompress mode, or num_chunks for decompress-chunks mode
     #[arg(index = 1)]
-    output: Option<PathBuf>,
+    output: Option<String>,
 }
 
 #[tokio::main]
@@ -52,32 +57,65 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--decompress requires an output path argument"))?;
         let compressed = std::fs::read(&input)?;
         let data = compress::decompress(&compressed)?;
-        std::fs::write(&output, &data)?;
+        std::fs::write(PathBuf::from(&output), &data)?;
         let _ = std::fs::remove_file(&input);
         return Ok(());
     }
 
-    if let Some(input) = args.compress {
-        // Compress mode: read file, compress, split into chunks, output count
-        let data = std::fs::read(&input)?;
+    if let Some(output_path) = args.decompress_chunks {
+        // Decompress-chunks mode: read N chunk files, decompress each, concatenate into output
+        use std::io::Write;
 
-        if (data.len() as u64) <= compress::CHUNKED_THRESHOLD {
-            // Not worth chunking — tell caller 0 chunks (use single scp)
+        let num_chunks: usize = args
+            .output
+            .ok_or_else(|| anyhow::anyhow!("--decompress-chunks requires num_chunks argument"))?
+            .parse()?;
+
+        let base = output_path.to_string_lossy().to_string();
+        let mut out = std::fs::File::create(&output_path)?;
+
+        for i in 0..num_chunks {
+            let chunk_path = format!("{base}.beamup-chunk-{i:04}");
+            let compressed = std::fs::read(&chunk_path)?;
+            let data = compress::decompress(&compressed)?;
+            out.write_all(&data)?;
+            let _ = std::fs::remove_file(&chunk_path);
+        }
+
+        return Ok(());
+    }
+
+    if let Some(input) = args.compress {
+        // Compress mode: stream file in 8MB chunks, compress each individually,
+        // write as separate chunk files. This avoids loading the whole file into memory.
+        use std::io::Read;
+
+        let metadata = std::fs::metadata(&input)?;
+        let file_size = metadata.len();
+
+        if file_size <= compress::CHUNKED_THRESHOLD {
             println!("0");
             return Ok(());
         }
 
-        let compressed = compress::compress(&data);
-        let chunks = compress::split_chunks(&compressed);
-        let num_chunks = chunks.len();
-
+        let mut file = std::fs::File::open(&input)?;
         let base = input.to_string_lossy();
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            let chunk_path = format!("{base}.beamup-lz4-chunk-{i:04}");
-            std::fs::write(&chunk_path, &chunk)?;
+        let mut chunk_idx = 0;
+        let mut buf = vec![0u8; compress::CHUNK_SIZE];
+
+        loop {
+            let bytes_read = file.read(&mut buf)?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let compressed = compress::compress(&buf[..bytes_read]);
+            let chunk_path = format!("{base}.beamup-lz4-chunk-{chunk_idx:04}");
+            std::fs::write(&chunk_path, &compressed)?;
+            chunk_idx += 1;
         }
 
-        println!("{num_chunks}");
+        println!("{chunk_idx}");
         return Ok(());
     }
 

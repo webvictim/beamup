@@ -171,29 +171,50 @@ impl SyncEngine {
 
         let push_count = to_push.len();
         let pull_count = to_pull.len();
-        eprintln!("  Plan: push {push_count} files, pull {pull_count} files via scp");
+        eprintln!("  Plan: push {push_count} files, pull {pull_count} files");
 
-        // Execute pushes in parallel
+        // Split pushes into inline (small) and scp (large)
         if !to_push.is_empty() {
-            let paths: Vec<String> = to_push.iter().map(|e| e.path.clone()).collect();
-            let results = self.transfer_pool.push_batch(paths).await;
-            let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
-            if !failures.is_empty() {
-                for f in &failures {
-                    warn!("push failed: {} — {:?}", f.path, f.error);
+            let (small, large): (Vec<_>, Vec<_>) = to_push
+                .iter()
+                .partition(|e| e.size <= INLINE_THRESHOLD);
+
+            // Send small files inline
+            for entry in &small {
+                let full_path = self.local_dir.join(&entry.path);
+                if let Ok(data) = std::fs::read(&full_path) {
+                    let hash = beamup_protocol::hash::hash_content(&data);
+                    self.transport
+                        .send(Message::FileContent {
+                            path: entry.path.clone(),
+                            hash,
+                            data,
+                        })
+                        .await?;
                 }
-                eprintln!("  {} push failures (see log)", failures.len());
             }
 
-            // Notify agent that pushed files are ready
-            for entry in &to_push {
-                self.transport
-                    .send(Message::FileReady {
-                        path: entry.path.clone(),
-                        hash: entry.hash,
-                        size: entry.size,
-                    })
-                    .await?;
+            // Push large files via scp
+            if !large.is_empty() {
+                let paths: Vec<String> = large.iter().map(|e| e.path.clone()).collect();
+                let results = self.transfer_pool.push_batch(paths).await;
+                let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
+                if !failures.is_empty() {
+                    for f in &failures {
+                        warn!("push failed: {} — {:?}", f.path, f.error);
+                    }
+                    eprintln!("  {} push failures (see log)", failures.len());
+                }
+
+                for entry in &large {
+                    self.transport
+                        .send(Message::FileReady {
+                            path: entry.path.clone(),
+                            hash: entry.hash,
+                            size: entry.size,
+                        })
+                        .await?;
+                }
             }
         }
 

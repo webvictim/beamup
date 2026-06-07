@@ -230,28 +230,19 @@ async fn handle_manifest(
             continue;
         }
         if !local_map.contains_key(entry.path.as_str()) {
-            if entry.size <= INLINE_THRESHOLD {
-                // Will be pushed inline — nothing to add to plan
-            } else {
+            to_push.push(SyncEntry {
+                path: entry.path.clone(),
+                hash: entry.hash,
+                size: entry.size,
+            });
+        } else {
+            let local = local_map[entry.path.as_str()];
+            if local.hash != entry.hash {
                 to_push.push(SyncEntry {
                     path: entry.path.clone(),
                     hash: entry.hash,
                     size: entry.size,
                 });
-            }
-        } else {
-            let local = local_map[entry.path.as_str()];
-            if local.hash != entry.hash {
-                // Different versions — for now, CLI wins during initial sync
-                if entry.size <= INLINE_THRESHOLD {
-                    // Will handle inline
-                } else {
-                    to_push.push(SyncEntry {
-                        path: entry.path.clone(),
-                        hash: entry.hash,
-                        size: entry.size,
-                    });
-                }
             }
         }
     }
@@ -262,16 +253,11 @@ async fn handle_manifest(
             continue;
         }
         if !remote_map.contains_key(entry.path.as_str()) {
-            if entry.size <= INLINE_THRESHOLD {
-                // Send inline now
-                send_file_inline(&entry.path, transport, watch_dir).await?;
-            } else {
-                to_pull.push(SyncEntry {
-                    path: entry.path.clone(),
-                    hash: entry.hash,
-                    size: entry.size,
-                });
-            }
+            to_pull.push(SyncEntry {
+                path: entry.path.clone(),
+                hash: entry.hash,
+                size: entry.size,
+            });
         }
     }
 
@@ -302,6 +288,7 @@ async fn handle_manifest(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn send_file_inline(path: &str, transport: &Transport, watch_dir: &Path) -> Result<()> {
     let full_path = watch_dir.join(path);
     let data = match std::fs::read(&full_path) {

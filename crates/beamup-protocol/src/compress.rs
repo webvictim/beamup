@@ -29,3 +29,81 @@ pub fn reassemble_chunks(mut chunks: Vec<Vec<u8>>) -> Vec<u8> {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_small() {
+        let data = b"hello world, this is a test of lz4 compression";
+        let compressed = compress(data);
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(data.as_slice(), decompressed.as_slice());
+    }
+
+    #[test]
+    fn round_trip_empty() {
+        let data = b"";
+        let compressed = compress(data);
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(data.as_slice(), decompressed.as_slice());
+    }
+
+    #[test]
+    fn round_trip_large_repetitive() {
+        // 10MB of repetitive data (compresses well)
+        let data: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 256) as u8).collect();
+        let compressed = compress(&data);
+        assert!(compressed.len() < data.len()); // should actually compress
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(data, decompressed);
+    }
+
+    #[test]
+    fn per_chunk_round_trip() {
+        // Simulate the streaming compression pattern:
+        // split into chunks, compress each independently, decompress each, concatenate
+        let data: Vec<u8> = (0..20 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let chunks = split_chunks(&data);
+
+        let compressed_chunks: Vec<Vec<u8>> = chunks.iter().map(|c| compress(c)).collect();
+
+        let mut reconstructed = Vec::new();
+        for cc in &compressed_chunks {
+            let decompressed = decompress(cc).unwrap();
+            reconstructed.extend_from_slice(&decompressed);
+        }
+
+        assert_eq!(data, reconstructed);
+    }
+
+    #[test]
+    fn split_chunks_correct_count() {
+        // Exactly 2 chunks
+        let data = vec![0u8; CHUNK_SIZE * 2];
+        assert_eq!(split_chunks(&data).len(), 2);
+
+        // 2 chunks + 1 byte remainder
+        let data = vec![0u8; CHUNK_SIZE * 2 + 1];
+        assert_eq!(split_chunks(&data).len(), 3);
+
+        // Less than 1 chunk
+        let data = vec![0u8; 100];
+        assert_eq!(split_chunks(&data).len(), 1);
+    }
+
+    #[test]
+    fn split_reassemble_identity() {
+        let data: Vec<u8> = (0..CHUNK_SIZE * 3 + 12345).map(|i| (i % 256) as u8).collect();
+        let chunks = split_chunks(&data);
+        let reassembled = reassemble_chunks(chunks);
+        assert_eq!(data, reassembled);
+    }
+
+    #[test]
+    fn decompress_invalid_data_returns_error() {
+        let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0x00, 0x01];
+        assert!(decompress(&garbage).is_err());
+    }
+}

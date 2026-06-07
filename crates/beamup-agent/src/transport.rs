@@ -3,30 +3,71 @@ use beamup_protocol::codec::MessageCodec;
 use beamup_protocol::messages::Message;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{stdin, stdout};
+use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite};
+use tracing::error;
 
 pub struct Transport {
-    reader: FramedRead<tokio::io::Stdin, MessageCodec>,
-    writer: FramedWrite<tokio::io::Stdout, MessageCodec>,
+    pub rx: mpsc::Receiver<Message>,
+    pub tx: mpsc::Sender<Message>,
 }
 
 impl Transport {
     pub fn new() -> Self {
-        let reader = FramedRead::new(stdin(), MessageCodec);
-        let writer = FramedWrite::new(stdout(), MessageCodec);
-        Self { reader, writer }
-    }
+        let (incoming_tx, incoming_rx) = mpsc::channel::<Message>(256);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Message>(256);
 
-    pub async fn recv(&mut self) -> Result<Option<Message>> {
-        match self.reader.next().await {
-            Some(Ok(msg)) => Ok(Some(msg)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
+        let writer_tx = outgoing_tx.clone();
+
+        // Reader task: reads from stdin, auto-replies to Pings, forwards everything else
+        tokio::spawn(async move {
+            let mut reader = FramedRead::new(stdin(), MessageCodec);
+            while let Some(result) = reader.next().await {
+                match result {
+                    Ok(Message::Ping) => {
+                        if writer_tx.send(Message::Pong).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(msg) => {
+                        if incoming_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("transport read error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Writer task: drains outgoing channel into stdout
+        tokio::spawn(async move {
+            let mut writer = FramedWrite::new(stdout(), MessageCodec);
+            while let Some(msg) = outgoing_rx.recv().await {
+                if let Err(e) = writer.send(msg).await {
+                    error!("transport write error: {e}");
+                    break;
+                }
+            }
+        });
+
+        Self {
+            rx: incoming_rx,
+            tx: outgoing_tx,
         }
     }
 
-    pub async fn send(&mut self, msg: Message) -> Result<()> {
-        self.writer.send(msg).await?;
+    pub async fn recv(&mut self) -> Result<Option<Message>> {
+        Ok(self.rx.recv().await)
+    }
+
+    pub async fn send(&self, msg: Message) -> Result<()> {
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|_| anyhow::anyhow!("transport closed"))?;
         Ok(())
     }
 }

@@ -1,1 +1,4 @@
 /target
+*.beamup-tmp
+*.beamup-chunk-tmp
+.claude/

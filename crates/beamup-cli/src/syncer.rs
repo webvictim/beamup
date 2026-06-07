@@ -343,6 +343,9 @@ impl SyncEngine {
                         final_chunk,
                     })
                     .await?;
+                if i % 16 == 15 {
+                    tokio::task::yield_now().await;
+                }
             }
         }
 

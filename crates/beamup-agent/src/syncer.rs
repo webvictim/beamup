@@ -66,18 +66,6 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
         });
     }
 
-    // Heartbeat
-    let (ping_tx, mut ping_rx) = mpsc::channel::<()>(1);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-            if ping_tx.send(()).await.is_err() {
-                break;
-            }
-        }
-    });
-
     loop {
         tokio::select! {
             msg = transport.recv() => {
@@ -85,7 +73,7 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
                     Some(msg) => {
                         handle_message(
                             msg,
-                            &mut transport,
+                            &transport,
                             &watch_dir,
                             &ignore_rules,
                             &mut file_states,
@@ -102,15 +90,12 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
                 if let Some(event) = event {
                     handle_watch_event(
                         event,
-                        &mut transport,
+                        &transport,
                         &watch_dir,
                         &mut file_states,
                         &mut suppress_set,
                     ).await?;
                 }
-            }
-            _ = ping_rx.recv() => {
-                // Handled below after select
             }
         }
 
@@ -123,7 +108,7 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
 
 async fn handle_message(
     msg: Message,
-    transport: &mut Transport,
+    transport: &Transport,
     watch_dir: &Path,
     ignore_rules: &IgnoreRules,
     file_states: &mut HashMap<String, FileState>,
@@ -149,7 +134,6 @@ async fn handle_message(
             data,
             final_chunk,
         } => {
-            // For chunks, accumulate in a temp file
             append_chunk(&path, offset, &data, final_chunk, watch_dir, file_states, suppress_set)
                 .await?;
         }
@@ -159,7 +143,6 @@ async fn handle_message(
             mtime: _,
             size: _,
         } => {
-            // Remote changed a file — check if we need it
             let local_state = file_states.get(&path);
             let needs_content = match local_state {
                 Some(state) => state.hash != hash,
@@ -203,7 +186,7 @@ async fn handle_message(
 
 async fn handle_manifest(
     remote_entries: Vec<ManifestEntry>,
-    transport: &mut Transport,
+    transport: &Transport,
     watch_dir: &Path,
     ignore_rules: &IgnoreRules,
     file_states: &mut HashMap<String, FileState>,
@@ -234,8 +217,6 @@ async fn handle_manifest(
         } else {
             let remote = remote_map[entry.path.as_str()];
             if remote.hash != entry.hash {
-                // Conflict or need to send — we have a different version
-                // During initial sync, send our version and also request theirs
                 send_file_content(&entry.path, transport, watch_dir).await?;
             }
             file_states.insert(
@@ -274,7 +255,7 @@ async fn handle_manifest(
     Ok(())
 }
 
-async fn send_file_content(path: &str, transport: &mut Transport, watch_dir: &Path) -> Result<()> {
+async fn send_file_content(path: &str, transport: &Transport, watch_dir: &Path) -> Result<()> {
     let full_path = watch_dir.join(path);
     let data = match std::fs::read(&full_path) {
         Ok(d) => d,
@@ -307,6 +288,9 @@ async fn send_file_content(path: &str, transport: &mut Transport, watch_dir: &Pa
                     final_chunk,
                 })
                 .await?;
+            if i % 16 == 15 {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -480,7 +464,7 @@ pub enum WatchEvent {
 
 async fn handle_watch_event(
     event: WatchEvent,
-    transport: &mut Transport,
+    transport: &Transport,
     watch_dir: &Path,
     file_states: &mut HashMap<String, FileState>,
     suppress_set: &mut HashMap<String, Instant>,
@@ -497,7 +481,6 @@ async fn handle_watch_event(
             };
             let hash = hash_content(&data);
 
-            // Check if actually changed
             if let Some(state) = file_states.get(&path) {
                 if state.hash == hash {
                     return Ok(());
@@ -513,10 +496,7 @@ async fn handle_watch_event(
                 .as_secs();
             let size = metadata.len();
 
-            file_states.insert(
-                path.clone(),
-                FileState { hash, mtime, size },
-            );
+            file_states.insert(path.clone(), FileState { hash, mtime, size });
 
             transport
                 .send(Message::FileChanged {

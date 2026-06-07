@@ -93,9 +93,9 @@ impl SyncEngine {
         }
 
         // Initial sync
-        eprintln!("Performing initial sync...");
+        info!("performing initial sync...");
         self.initial_sync().await?;
-        eprintln!("Initial sync complete.");
+        info!("initial sync complete");
 
         // Start local watcher
         let mut watcher = FsWatcher::new(&self.local_dir, &self.ignore_rules)?;
@@ -118,7 +118,7 @@ impl SyncEngine {
                             }
                         }
                         None => {
-                            eprintln!("Connection to beam lost.");
+                            warn!("connection to beam lost");
                             break;
                         }
                     }
@@ -136,7 +136,7 @@ impl SyncEngine {
                 _ = ping_interval.tick() => {
                     self.transport.send(Message::Ping).await?;
                     if last_pong.elapsed() > PING_TIMEOUT {
-                        eprintln!("Beam not responding (no pong in {:?}), connection may be dead.", PING_TIMEOUT);
+                        warn!("beam not responding (no pong in {:?}), connection may be dead", PING_TIMEOUT);
                     }
                 }
             }
@@ -149,7 +149,7 @@ impl SyncEngine {
         // Build and send our manifest
         let manifest = self.build_local_manifest()?;
         let entry_count = manifest.len();
-        eprintln!("  Local: {entry_count} entries");
+        info!("local: {entry_count} entries");
         self.transport
             .send(Message::FileManifest { entries: manifest })
             .await?;
@@ -173,7 +173,7 @@ impl SyncEngine {
 
         let push_count = to_push.len();
         let pull_count = to_pull.len();
-        eprintln!("  Plan: push {push_count} files, pull {pull_count} files");
+        info!("sync plan: push {push_count} files, pull {pull_count} files");
 
         // Split pushes into inline (small) and scp (large)
         if !to_push.is_empty() {
@@ -205,7 +205,7 @@ impl SyncEngine {
                     for f in &failures {
                         warn!("push failed: {} — {:?}", f.path, f.error);
                     }
-                    eprintln!("  {} push failures (see log)", failures.len());
+                    warn!("{} push failures", failures.len());
                 }
 
                 for entry in &large {
@@ -229,7 +229,7 @@ impl SyncEngine {
                 for f in &failures {
                     warn!("pull failed: {} — {:?}", f.path, f.error);
                 }
-                eprintln!("  {} pull failures (see log)", failures.len());
+                warn!("{} pull failures", failures.len());
             }
 
             // Update local state for pulled files
@@ -339,9 +339,7 @@ impl SyncEngine {
                 local_hash: _,
                 remote_hash: _,
             } => {
-                eprintln!(
-                    "CONFLICT: {path} — local and remote both changed. Local saved as {path}.local.conflict"
-                );
+                warn!("CONFLICT: {path} — local and remote both changed. Local saved as {path}.local.conflict");
             }
             _ => {
                 debug!("unhandled remote message: {msg:?}");
@@ -527,7 +525,7 @@ impl SyncEngine {
                 if current_hash != state.hash && current_hash != hash {
                     let conflict_path = format!("{}.local.conflict", full_path.display());
                     std::fs::copy(&full_path, &conflict_path)?;
-                    eprintln!(
+                    warn!(
                         "CONFLICT: {path} — local version saved as {path}.local.conflict"
                     );
                 }

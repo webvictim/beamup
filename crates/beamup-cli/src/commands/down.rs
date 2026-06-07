@@ -32,11 +32,11 @@ pub async fn run(args: DownArgs) -> Result<()> {
     };
 
     if !args.keep_beam {
-        eprintln!("Destroying beam: {beam_id}...");
+        info!("destroying beam: {beam_id}...");
         Beam::destroy(&beam_id).await?;
-        eprintln!("Beam destroyed.");
+        info!("beam destroyed");
     } else {
-        eprintln!("Stopped syncing (beam {beam_id} kept alive).");
+        info!("stopped syncing (beam {beam_id} kept alive)");
     }
 
     Session::remove()?;

@@ -26,19 +26,20 @@ struct Args {
     #[arg(long)]
     decompress: Option<PathBuf>,
 
-    /// Compress a file for chunked transfer: --compress <file>
-    /// Outputs the number of chunks to stdout. Creates <file>.beamup-lz4-chunk-NNNN files.
+    /// Compress a file for chunked transfer: --compress <file> <file_id>
+    /// Writes chunks to /tmp/beamup-xfer/<file_id>/chunk-NNNN
+    /// Outputs the number of chunks to stdout.
     #[arg(long)]
     compress: Option<PathBuf>,
 
-    /// Decompress chunked files: --decompress-chunks <output-path> <num-chunks>
-    /// Reads <output-path>.beamup-chunk-NNNN files, decompresses each, writes concatenated output.
+    /// Decompress chunked files: --decompress-chunks <output-path> <num-chunks> <file_id>
+    /// Reads from /tmp/beamup-xfer/<file_id>/chunk-NNNN, writes concatenated output.
     #[arg(long)]
     decompress_chunks: Option<PathBuf>,
 
-    /// Output path for decompress mode, or num_chunks for decompress-chunks mode
-    #[arg(index = 1)]
-    output: Option<String>,
+    /// Positional arguments (varies by mode)
+    #[arg(trailing_var_arg = true)]
+    positional: Vec<String>,
 }
 
 #[tokio::main]
@@ -51,44 +52,47 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     if let Some(input) = args.decompress {
-        // Decompress mode: read lz4 file, decompress, write to output
         let output = args
-            .output
-            .ok_or_else(|| anyhow::anyhow!("--decompress requires an output path argument"))?;
+            .positional
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("--decompress requires: <input> <output>"))?;
         let compressed = std::fs::read(&input)?;
         let data = compress::decompress(&compressed)?;
-        std::fs::write(PathBuf::from(&output), &data)?;
+        std::fs::write(PathBuf::from(output), &data)?;
         let _ = std::fs::remove_file(&input);
         return Ok(());
     }
 
     if let Some(output_path) = args.decompress_chunks {
-        // Decompress-chunks mode: read N chunk files, decompress each, concatenate into output
         use std::io::Write;
 
-        let num_chunks: usize = args
-            .output
-            .ok_or_else(|| anyhow::anyhow!("--decompress-chunks requires num_chunks argument"))?
-            .parse()?;
+        if args.positional.len() < 2 {
+            anyhow::bail!("--decompress-chunks requires: <output> <num_chunks> <file_id>");
+        }
+        let num_chunks: usize = args.positional[0].parse()?;
+        let file_id = &args.positional[1];
+        let tmp_dir = format!("/tmp/beamup-xfer/{file_id}");
 
-        let base = output_path.to_string_lossy().to_string();
         let mut out = std::fs::File::create(&output_path)?;
-
         for i in 0..num_chunks {
-            let chunk_path = format!("{base}.beamup-chunk-{i:04}");
+            let chunk_path = format!("{tmp_dir}/chunk-{i:04}");
             let compressed = std::fs::read(&chunk_path)?;
             let data = compress::decompress(&compressed)?;
             out.write_all(&data)?;
             let _ = std::fs::remove_file(&chunk_path);
         }
+        let _ = std::fs::remove_dir_all(&tmp_dir);
 
         return Ok(());
     }
 
     if let Some(input) = args.compress {
-        // Compress mode: stream file in 8MB chunks, compress each individually,
-        // write as separate chunk files. This avoids loading the whole file into memory.
         use std::io::Read;
+
+        let file_id = args
+            .positional
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("--compress requires: <file> <file_id>"))?;
 
         let metadata = std::fs::metadata(&input)?;
         let file_size = metadata.len();
@@ -98,8 +102,10 @@ async fn main() -> Result<()> {
             return Ok(());
         }
 
+        let tmp_dir = format!("/tmp/beamup-xfer/{file_id}");
+        std::fs::create_dir_all(&tmp_dir)?;
+
         let mut file = std::fs::File::open(&input)?;
-        let base = input.to_string_lossy();
         let mut chunk_idx = 0;
         let mut buf = vec![0u8; compress::CHUNK_SIZE];
 
@@ -110,7 +116,7 @@ async fn main() -> Result<()> {
             }
 
             let compressed = compress::compress(&buf[..bytes_read]);
-            let chunk_path = format!("{base}.beamup-lz4-chunk-{chunk_idx:04}");
+            let chunk_path = format!("{tmp_dir}/chunk-{chunk_idx:04}");
             std::fs::write(&chunk_path, &compressed)?;
             chunk_idx += 1;
         }
@@ -120,7 +126,7 @@ async fn main() -> Result<()> {
     }
 
     if !args.serve {
-        anyhow::bail!("agent must be run with --serve, --decompress, or --compress");
+        anyhow::bail!("agent must be run with --serve, --decompress, --compress, or --decompress-chunks");
     }
 
     std::fs::create_dir_all(&args.watch_dir)?;

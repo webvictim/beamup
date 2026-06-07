@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use beamup_protocol::compress::{self, CHUNKED_THRESHOLD};
@@ -16,11 +17,14 @@ pub enum Direction {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct TransferResult {
     pub path: String,
     pub direction: Direction,
     pub success: bool,
     pub error: Option<String>,
+    pub bytes: u64,
+    pub duration_ms: u64,
 }
 
 pub struct TransferPool {
@@ -50,7 +54,6 @@ impl TransferPool {
         }
     }
 
-    /// Push a local file to the beam. Large files are compressed, chunked, and transferred in parallel.
     pub fn push(&self, relative_path: String) -> JoinHandle<()> {
         let sem = self.semaphore.clone();
         let tx = self.results_tx.clone();
@@ -59,19 +62,39 @@ impl TransferPool {
         let remote_path = format!("{}/{}", self.remote_dir, relative_path);
 
         tokio::spawn(async move {
+            let start = Instant::now();
+            let size = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
             let result = push_file(&beam_id, &local_path, &remote_path, &sem).await;
+            let duration = start.elapsed();
+
+            if result.is_ok() {
+                let bw = if duration.as_secs_f64() > 0.0 {
+                    size as f64 / duration.as_secs_f64() / 1024.0 / 1024.0
+                } else {
+                    0.0
+                };
+                info!(
+                    "pushed: {} ({} bytes in {:.1}s, {:.1} MB/s)",
+                    relative_path,
+                    size,
+                    duration.as_secs_f64(),
+                    bw
+                );
+            }
+
             let _ = tx
                 .send(TransferResult {
                     path: relative_path,
                     direction: Direction::Push,
                     success: result.is_ok(),
                     error: result.err().map(|e| e.to_string()),
+                    bytes: size,
+                    duration_ms: duration.as_millis() as u64,
                 })
                 .await;
         })
     }
 
-    /// Pull a file from the beam. Large files are pulled as compressed chunks then reassembled locally.
     pub fn pull(&self, relative_path: String) -> JoinHandle<()> {
         let sem = self.semaphore.clone();
         let tx = self.results_tx.clone();
@@ -80,26 +103,44 @@ impl TransferPool {
         let remote_path = format!("{}/{}", self.remote_dir, relative_path);
 
         tokio::spawn(async move {
+            let start = Instant::now();
             let result = pull_file(&beam_id, &remote_path, &local_path, &sem).await;
+            let duration = start.elapsed();
+            let size = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
+
+            if result.is_ok() {
+                let bw = if duration.as_secs_f64() > 0.0 {
+                    size as f64 / duration.as_secs_f64() / 1024.0 / 1024.0
+                } else {
+                    0.0
+                };
+                info!(
+                    "pulled: {} ({} bytes in {:.1}s, {:.1} MB/s)",
+                    relative_path,
+                    size,
+                    duration.as_secs_f64(),
+                    bw
+                );
+            }
+
             let _ = tx
                 .send(TransferResult {
                     path: relative_path,
                     direction: Direction::Pull,
                     success: result.is_ok(),
                     error: result.err().map(|e| e.to_string()),
+                    bytes: size,
+                    duration_ms: duration.as_millis() as u64,
                 })
                 .await;
         })
     }
 
-    /// Push multiple files in parallel. Waits for all to complete.
     pub async fn push_batch(&mut self, paths: Vec<String>) -> Vec<TransferResult> {
         let handles: Vec<_> = paths.into_iter().map(|p| self.push(p)).collect();
-
         for handle in handles {
             let _ = handle.await;
         }
-
         let mut results = Vec::new();
         while let Ok(result) = self.results_rx.try_recv() {
             results.push(result);
@@ -107,14 +148,11 @@ impl TransferPool {
         results
     }
 
-    /// Pull multiple files in parallel. Waits for all to complete.
     pub async fn pull_batch(&mut self, paths: Vec<String>) -> Vec<TransferResult> {
         let handles: Vec<_> = paths.into_iter().map(|p| self.pull(p)).collect();
-
         for handle in handles {
             let _ = handle.await;
         }
-
         let mut results = Vec::new();
         while let Ok(result) = self.results_rx.try_recv() {
             results.push(result);
@@ -123,7 +161,10 @@ impl TransferPool {
     }
 }
 
-/// Push a file to the beam. If it's large, compress per-chunk + parallel scp + reassemble.
+fn file_id(path: &str) -> String {
+    format!("{:x}", beamup_protocol::hash::hash_content(path.as_bytes()))
+}
+
 async fn push_file(
     beam_id: &str,
     local_path: &Path,
@@ -134,30 +175,31 @@ async fn push_file(
     let size = metadata.len();
 
     if size <= CHUNKED_THRESHOLD {
-        // Small-ish file: single scp
         let _permit = sem.acquire().await.unwrap();
         Beam::scp_to_beam(beam_id, local_path, remote_path).await?;
         debug!("pushed (single): {} ({size} bytes)", local_path.display());
     } else {
-        // Large file: read in 8MB blocks, compress each independently, parallel scp
         use std::io::Read;
 
-        let file_id = format!("{:x}", beamup_protocol::hash::hash_content(remote_path.as_bytes()));
-        let tmp_dir = std::env::temp_dir().join(format!("beamup-push-{file_id}"));
-        std::fs::create_dir_all(&tmp_dir)?;
+        let fid = file_id(remote_path);
+        let local_tmp = std::env::temp_dir().join(format!("beamup-push-{fid}"));
+        std::fs::create_dir_all(&local_tmp)?;
+        let remote_tmp = format!("/tmp/beamup-xfer/{fid}");
+
+        // Ensure remote temp dir exists
+        Beam::exec_shell(beam_id, &format!("mkdir -p '{remote_tmp}'")).await?;
 
         let mut file = std::fs::File::open(local_path)?;
         let mut buf = vec![0u8; compress::CHUNK_SIZE];
         let mut chunk_idx = 0;
 
-        // Read and compress chunks
         loop {
             let bytes_read = file.read(&mut buf)?;
             if bytes_read == 0 {
                 break;
             }
             let compressed = compress::compress(&buf[..bytes_read]);
-            let chunk_local = tmp_dir.join(format!("chunk_{chunk_idx:04}"));
+            let chunk_local = local_tmp.join(format!("chunk-{chunk_idx:04}"));
             std::fs::write(&chunk_local, &compressed)?;
             chunk_idx += 1;
         }
@@ -168,11 +210,10 @@ async fn push_file(
             local_path.display()
         );
 
-        // Parallel scp each chunk
         let mut handles = Vec::with_capacity(num_chunks);
         for i in 0..num_chunks {
-            let chunk_local = tmp_dir.join(format!("chunk_{i:04}"));
-            let chunk_remote = format!("{remote_path}.beamup-chunk-{i:04}");
+            let chunk_local = local_tmp.join(format!("chunk-{i:04}"));
+            let chunk_remote = format!("{remote_tmp}/chunk-{i:04}");
             let beam_id = beam_id.to_string();
             let sem = sem.clone();
 
@@ -188,9 +229,7 @@ async fn push_file(
             handle.await??;
         }
 
-        // Reassemble and decompress on the beam using the agent
-        // The agent's --decompress-chunks mode handles: read N chunk files,
-        // decompress each (lz4), concatenate into output file
+        // Agent reassembles: reads chunks from /tmp/beamup-xfer/<fid>/, decompresses, writes output
         Beam::exec_cmd(
             beam_id,
             &[
@@ -198,18 +237,17 @@ async fn push_file(
                 "--decompress-chunks",
                 remote_path,
                 &num_chunks.to_string(),
+                &fid,
             ],
         )
         .await?;
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        debug!("pushed (chunked): {} ({num_chunks} chunks)", local_path.display());
+        let _ = std::fs::remove_dir_all(&local_tmp);
     }
 
     Ok(())
 }
 
-/// Pull a file from the beam. If it's large, have the agent compress + chunk, then parallel scp pull + reassemble locally.
 async fn pull_file(
     beam_id: &str,
     remote_path: &str,
@@ -220,36 +258,37 @@ async fn pull_file(
         std::fs::create_dir_all(parent)?;
     }
 
-    // Ask the agent to prepare chunked transfer by compressing + splitting
-    // Use exec to invoke the agent in compress mode
+    let fid = file_id(remote_path);
+
+    // Agent compresses + splits into /tmp/beamup-xfer/<fid>/
     let output = Beam::exec_cmd_output(
         beam_id,
-        &["/tmp/beamup-agent", "--compress", remote_path],
+        &["/tmp/beamup-agent", "--compress", remote_path, &fid],
     )
     .await?;
 
-    // Agent outputs the number of chunks as a single line
     let num_chunks: usize = output.trim().parse().unwrap_or(0);
 
     if num_chunks == 0 {
-        // File is small enough for single scp or doesn't exist
+        // Atomic pull: scp to temp file, then rename
+        let tmp_path = local_path.with_extension("beamup-pull-tmp");
         let _permit = sem.acquire().await.unwrap();
-        Beam::scp_from_beam(beam_id, remote_path, local_path).await?;
+        Beam::scp_from_beam(beam_id, remote_path, &tmp_path).await?;
+        std::fs::rename(&tmp_path, local_path)?;
         debug!("pulled (single): {remote_path}");
         return Ok(());
     }
 
     info!("pulling chunked: {remote_path} ({num_chunks} chunks)");
 
-    let file_id = format!("{:x}", beamup_protocol::hash::hash_content(remote_path.as_bytes()));
-    let tmp_dir = std::env::temp_dir().join(format!("beamup-pull-{file_id}"));
-    std::fs::create_dir_all(&tmp_dir)?;
+    let local_tmp = std::env::temp_dir().join(format!("beamup-pull-{fid}"));
+    std::fs::create_dir_all(&local_tmp)?;
+    let remote_tmp = format!("/tmp/beamup-xfer/{fid}");
 
-    // Pull chunks in parallel
     let mut handles = Vec::with_capacity(num_chunks);
     for i in 0..num_chunks {
-        let chunk_remote = format!("{remote_path}.beamup-lz4-chunk-{i:04}");
-        let chunk_local = tmp_dir.join(format!("chunk_{i:04}"));
+        let chunk_remote = format!("{remote_tmp}/chunk-{i:04}");
+        let chunk_local = local_tmp.join(format!("chunk-{i:04}"));
         let beam_id = beam_id.to_string();
         let sem = sem.clone();
 
@@ -269,7 +308,7 @@ async fn pull_file(
         use std::io::Write;
         let mut out = std::fs::File::create(&tmp_path)?;
         for i in 0..num_chunks {
-            let chunk_local = tmp_dir.join(format!("chunk_{i:04}"));
+            let chunk_local = local_tmp.join(format!("chunk-{i:04}"));
             let chunk_data = std::fs::read(&chunk_local)?;
             let decompressed = compress::decompress(&chunk_data)?;
             out.write_all(&decompressed)?;
@@ -278,21 +317,14 @@ async fn pull_file(
     }
     std::fs::rename(&tmp_path, local_path)?;
 
-    // Clean up local temp dir and remote chunks
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    let mut rm_cmd = String::from("rm -f");
-    for i in 0..num_chunks {
-        rm_cmd.push_str(&format!(" '{remote_path}.beamup-lz4-chunk-{i:04}'"));
-    }
-    let _ = Beam::exec_shell(beam_id, &rm_cmd).await;
+    // Clean up
+    let _ = std::fs::remove_dir_all(&local_tmp);
+    let _ = Beam::exec_shell(beam_id, &format!("rm -rf '{remote_tmp}'")).await;
 
-    debug!("pulled (chunked): {remote_path} ({num_chunks} chunks)");
     Ok(())
 }
 
-/// Deploy the agent binary using chunked parallel transfer (no compression —
-/// the agent isn't available yet to decompress, and raw chunked parallel scp
-/// is already much faster than a single serial transfer).
+/// Deploy the agent binary using chunked parallel transfer
 pub async fn deploy_agent_chunked(
     beam_id: &str,
     agent_path: &Path,
@@ -311,17 +343,20 @@ pub async fn deploy_agent_chunked(
         return Ok(());
     }
 
-    let tmp_dir = std::env::temp_dir().join("beamup-agent-deploy");
-    std::fs::create_dir_all(&tmp_dir)?;
+    let local_tmp = std::env::temp_dir().join("beamup-agent-deploy");
+    std::fs::create_dir_all(&local_tmp)?;
+
+    // Ensure remote temp dir exists
+    Beam::exec_shell(beam_id, "mkdir -p /tmp/beamup-deploy").await?;
 
     let sem = Arc::new(Semaphore::new(concurrency));
 
     let mut handles = Vec::with_capacity(num_chunks);
     for (i, chunk) in chunks.into_iter().enumerate() {
-        let chunk_local = tmp_dir.join(format!("agent_chunk_{i:04}"));
+        let chunk_local = local_tmp.join(format!("chunk-{i:04}"));
         std::fs::write(&chunk_local, &chunk)?;
 
-        let chunk_remote = format!("/tmp/beamup-agent.chunk-{i:04}");
+        let chunk_remote = format!("/tmp/beamup-deploy/chunk-{i:04}");
         let beam_id = beam_id.to_string();
         let sem = sem.clone();
 
@@ -340,16 +375,14 @@ pub async fn deploy_agent_chunked(
     // Reassemble on beam with cat
     let mut cat_cmd = String::from("cat");
     for i in 0..num_chunks {
-        cat_cmd.push_str(&format!(" /tmp/beamup-agent.chunk-{i:04}"));
+        cat_cmd.push_str(&format!(" /tmp/beamup-deploy/chunk-{i:04}"));
     }
-    cat_cmd.push_str(" > /tmp/beamup-agent && rm -f");
-    for i in 0..num_chunks {
-        cat_cmd.push_str(&format!(" /tmp/beamup-agent.chunk-{i:04}"));
-    }
+    cat_cmd.push_str(" > /tmp/beamup-agent && rm -rf /tmp/beamup-deploy");
 
     Beam::exec_shell(beam_id, &cat_cmd).await?;
     Beam::exec_cmd(beam_id, &["chmod", "+x", "/tmp/beamup-agent"]).await?;
 
+    let _ = std::fs::remove_dir_all(&local_tmp);
     info!("agent deployed ({num_chunks} chunks)");
     Ok(())
 }

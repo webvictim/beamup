@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
+use tracing::info;
 
 use crate::beam::Beam;
 use crate::config::Session;
@@ -49,7 +50,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
     }
 
     // Deploy agent (in case it's not running)
-    eprintln!("Deploying agent...");
+    info!("deploying agent...");
     Beam::deploy_agent(&beam_id, args.concurrency).await?;
 
     let session = Session {
@@ -59,7 +60,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
     };
     session.save()?;
 
-    eprintln!("Starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
+    info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
 
     let mut engine =
         SyncEngine::new(beam_id, local_dir, args.remote_dir, args.concurrency).await?;

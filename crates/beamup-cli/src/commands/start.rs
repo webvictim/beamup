@@ -54,9 +54,9 @@ pub async fn run(args: StartArgs) -> Result<()> {
         }
         id
     } else {
-        eprintln!("Creating beam...");
+        info!("creating beam...");
         let beam = Beam::create().await?;
-        eprintln!("Beam created: {}", beam.id);
+        info!("beam created: {}", beam.id);
         beam.id
     };
 
@@ -68,10 +68,10 @@ pub async fn run(args: StartArgs) -> Result<()> {
     };
     session.save()?;
 
-    eprintln!("Deploying agent to beam...");
+    info!("deploying agent to beam...");
     Beam::deploy_agent(&beam_id, args.concurrency).await?;
 
-    eprintln!("Starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
+    info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
 
     let mut engine =
         SyncEngine::new(beam_id, local_dir, args.remote_dir, args.concurrency).await?;

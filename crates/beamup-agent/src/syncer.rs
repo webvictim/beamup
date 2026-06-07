@@ -10,6 +10,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+#[cfg(target_os = "linux")]
+use tracing::error;
+
 use crate::transport::Transport;
 
 const CHUNK_SIZE: usize = 256 * 1024; // 256 KB
@@ -48,7 +51,8 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
     };
 
     // Set up watcher channel
-    let (_watch_tx, mut watch_rx) = mpsc::channel::<WatchEvent>(1024);
+    #[allow(unused_variables)]
+    let (watch_tx, mut watch_rx) = mpsc::channel::<WatchEvent>(1024);
 
     // Start filesystem watcher
     #[cfg(target_os = "linux")]

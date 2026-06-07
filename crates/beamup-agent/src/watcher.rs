@@ -12,7 +12,8 @@ use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 #[cfg(target_os = "linux")]
 use tokio::sync::mpsc;
 #[cfg(target_os = "linux")]
-use tracing::{debug, warn};
+#[allow(unused_imports)]
+use tracing::debug;
 
 #[cfg(target_os = "linux")]
 use crate::syncer::WatchEvent;

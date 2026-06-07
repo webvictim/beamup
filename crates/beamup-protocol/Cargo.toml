@@ -1,0 +1,16 @@
+[package]
+name = "beamup-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+xxhash-rust = { workspace = true }
+bytes = { workspace = true }
+tokio-util = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+anyhow = { workspace = true }
+ignore = "0.4"
+globset = "0.4"

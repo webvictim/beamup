@@ -1,0 +1,28 @@
+[package]
+name = "beamup-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "beamup"
+path = "src/main.rs"
+
+[dependencies]
+beamup-protocol = { path = "../beamup-protocol" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+rmp-serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+notify = "7"
+notify-debouncer-full = "0.4"
+indicatif = "0.17"
+crossterm = "0.28"
+directories = "5"
+futures-util = { version = "0.3", features = ["sink"] }

@@ -113,40 +113,9 @@ impl Beam {
         Ok(beams)
     }
 
-    pub async fn deploy_agent(beam_id: &str) -> Result<()> {
+    pub async fn deploy_agent(beam_id: &str, concurrency: usize) -> Result<()> {
         let agent_path = agent_binary_path()?;
-
-        // SCP agent to beam
-        let remote_path = format!("{beam_id}:/tmp/beamup-agent");
-        let output = Command::new("tsh")
-            .args(["beams", "scp", &agent_path.to_string_lossy(), &remote_path])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("failed to scp agent to beam")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("scp agent failed: {stderr}");
-        }
-
-        // Make executable
-        let output = Command::new("tsh")
-            .args(["beams", "exec", beam_id, "--", "chmod", "+x", "/tmp/beamup-agent"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("failed to chmod agent")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("chmod agent failed: {stderr}");
-        }
-
-        debug!("agent deployed to beam {beam_id}");
-        Ok(())
+        crate::transfer::deploy_agent_chunked(beam_id, &agent_path, concurrency).await
     }
 
     pub fn spawn_agent(beam_id: &str, remote_dir: &str) -> Result<tokio::process::Child> {
@@ -222,5 +191,47 @@ impl Beam {
         }
 
         Ok(())
+    }
+
+    /// Run a non-interactive command in the beam (no output captured)
+    pub async fn exec_cmd(beam_id: &str, cmd: &[&str]) -> Result<()> {
+        let mut args = vec!["beams", "exec", beam_id, "--"];
+        args.extend(cmd);
+
+        let output = Command::new("tsh")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("failed to exec in beam")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("exec failed ({}): {stderr}", cmd.join(" "));
+        }
+
+        Ok(())
+    }
+
+    /// Run a non-interactive command and capture stdout
+    pub async fn exec_cmd_output(beam_id: &str, cmd: &[&str]) -> Result<String> {
+        let mut args = vec!["beams", "exec", beam_id, "--"];
+        args.extend(cmd);
+
+        let output = Command::new("tsh")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("failed to exec in beam")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("exec failed ({}): {stderr}", cmd.join(" "));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 }

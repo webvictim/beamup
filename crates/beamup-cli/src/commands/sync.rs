@@ -50,7 +50,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
 
     // Deploy agent (in case it's not running)
     eprintln!("Deploying agent...");
-    Beam::deploy_agent(&beam_id).await?;
+    Beam::deploy_agent(&beam_id, args.concurrency).await?;
 
     let session = Session {
         beam_id: beam_id.clone(),

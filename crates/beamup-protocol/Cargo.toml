@@ -14,3 +14,4 @@ tokio = { workspace = true, features = ["io-util"] }
 anyhow = { workspace = true }
 ignore = "0.4"
 globset = "0.4"
+lz4_flex = "0.11"

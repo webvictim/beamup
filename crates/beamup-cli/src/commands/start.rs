@@ -69,7 +69,7 @@ pub async fn run(args: StartArgs) -> Result<()> {
     session.save()?;
 
     eprintln!("Deploying agent to beam...");
-    Beam::deploy_agent(&beam_id).await?;
+    Beam::deploy_agent(&beam_id, args.concurrency).await?;
 
     eprintln!("Starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
 

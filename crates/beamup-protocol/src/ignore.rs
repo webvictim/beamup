@@ -46,13 +46,20 @@ impl IgnoreRules {
     }
 
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        for rule in &self.rules {
-            let matched = rule.matched(path, is_dir);
-            if matched.is_ignore() {
-                return true;
-            }
-            if matched.is_whitelist() {
-                return false;
+        // Check the path itself and all ancestor directories
+        // This ensures that files inside an ignored directory are also ignored
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component);
+            let check_is_dir = if current == path { is_dir } else { true };
+            for rule in &self.rules {
+                let matched = rule.matched(&current, check_is_dir);
+                if matched.is_ignore() {
+                    return true;
+                }
+                if matched.is_whitelist() {
+                    return false;
+                }
             }
         }
         false

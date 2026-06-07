@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
 use anyhow::{Context, Result};
@@ -180,5 +180,47 @@ impl Beam {
             .context("failed to exec in beam")?;
 
         Ok(status)
+    }
+
+    /// scp a local file to the beam
+    pub async fn scp_to_beam(beam_id: &str, local_path: &Path, remote_path: &str) -> Result<()> {
+        let dest = format!("{beam_id}:{remote_path}");
+        let output = Command::new("tsh")
+            .args(["beams", "scp", &local_path.to_string_lossy(), &dest])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("failed to run tsh beams scp (push)")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("scp push failed for {}: {stderr}", local_path.display());
+        }
+
+        Ok(())
+    }
+
+    /// scp a file from the beam to local
+    pub async fn scp_from_beam(beam_id: &str, remote_path: &str, local_path: &Path) -> Result<()> {
+        if let Some(parent) = local_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let src = format!("{beam_id}:{remote_path}");
+        let output = Command::new("tsh")
+            .args(["beams", "scp", &src, &local_path.to_string_lossy()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("failed to run tsh beams scp (pull)")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("scp pull failed for {remote_path}: {stderr}");
+        }
+
+        Ok(())
     }
 }

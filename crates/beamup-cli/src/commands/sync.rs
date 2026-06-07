@@ -20,6 +20,10 @@ pub struct SyncArgs {
     /// Remote directory to sync into
     #[arg(short, long, default_value = "/home/beams/sync")]
     pub remote_dir: String,
+
+    /// Max concurrent scp transfers
+    #[arg(short, long, default_value = "8")]
+    pub concurrency: usize,
 }
 
 pub async fn run(args: SyncArgs) -> Result<()> {
@@ -57,6 +61,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
 
     eprintln!("Starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
 
-    let mut engine = SyncEngine::new(beam_id, local_dir, args.remote_dir).await?;
+    let mut engine =
+        SyncEngine::new(beam_id, local_dir, args.remote_dir, args.concurrency).await?;
     engine.run().await
 }

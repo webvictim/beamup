@@ -26,6 +26,10 @@ pub struct StartArgs {
     #[arg(long)]
     pub no_initial_sync: bool,
 
+    /// Max concurrent scp transfers
+    #[arg(short, long, default_value = "8")]
+    pub concurrency: usize,
+
     /// Additional exclude patterns
     #[arg(long)]
     pub exclude: Vec<String>,
@@ -44,7 +48,6 @@ pub async fn run(args: StartArgs) -> Result<()> {
     // Create or use existing beam
     let beam_id = if let Some(id) = args.beam {
         info!("using existing beam: {id}");
-        // Verify beam exists
         let beams = Beam::list().await?;
         if !beams.iter().any(|b| b.id == id) {
             anyhow::bail!("beam not found: {id}");
@@ -70,6 +73,7 @@ pub async fn run(args: StartArgs) -> Result<()> {
 
     eprintln!("Starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
 
-    let mut engine = SyncEngine::new(beam_id, local_dir, args.remote_dir).await?;
+    let mut engine =
+        SyncEngine::new(beam_id, local_dir, args.remote_dir, args.concurrency).await?;
     engine.run().await
 }

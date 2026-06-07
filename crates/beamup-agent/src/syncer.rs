@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use beamup_protocol::hash::{hash_content, hash_file};
 use beamup_protocol::ignore::IgnoreRules;
-use beamup_protocol::messages::{ManifestEntry, Message, PROTOCOL_VERSION};
+use beamup_protocol::messages::{ManifestEntry, Message, SyncEntry, INLINE_THRESHOLD, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -15,8 +15,7 @@ use tracing::error;
 
 use crate::transport::Transport;
 
-const CHUNK_SIZE: usize = 256 * 1024; // 256 KB
-const SUPPRESS_DURATION: Duration = Duration::from_millis(200);
+const SUPPRESS_DURATION: Duration = Duration::from_millis(500);
 
 #[allow(dead_code)]
 struct FileState {
@@ -99,7 +98,6 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
             }
         }
 
-        // Clean expired suppression entries
         suppress_set.retain(|_, expiry| expiry.elapsed() < SUPPRESS_DURATION);
     }
 
@@ -122,35 +120,52 @@ async fn handle_message(
         Message::FileManifest { entries } => {
             handle_manifest(entries, transport, watch_dir, ignore_rules, file_states).await?;
         }
-        Message::RequestContent { path } => {
-            send_file_content(&path, transport, watch_dir).await?;
-        }
         Message::FileContent { path, hash, data } => {
-            write_file(&path, &data, hash, watch_dir, file_states, suppress_set).await?;
+            write_file(&path, &data, hash, watch_dir, file_states, suppress_set)?;
         }
-        Message::FileContentChunk {
+        Message::FileReady {
             path,
-            offset,
-            data,
-            final_chunk,
+            hash,
+            size,
         } => {
-            append_chunk(&path, offset, &data, final_chunk, watch_dir, file_states, suppress_set)
-                .await?;
+            // CLI has pushed a file via scp — update our state
+            suppress_set.insert(path.clone(), Instant::now());
+            let full_path = watch_dir.join(&path);
+            let actual_hash = if full_path.exists() {
+                hash_file(&full_path).unwrap_or(0)
+            } else {
+                0
+            };
+            let mtime = full_path
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::now())
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            file_states.insert(
+                path.clone(),
+                FileState {
+                    hash: actual_hash,
+                    mtime,
+                    size,
+                },
+            );
+            debug!("file ready (scp'd): {path} (expected hash {hash}, actual {actual_hash})");
+        }
+        Message::FileReceived { path, hash } => {
+            // CLI pulled a file via scp — just bookkeeping
+            debug!("file received by cli: {path} (hash {hash})");
         }
         Message::FileChanged {
             path,
-            hash,
+            hash: _,
             mtime: _,
-            size: _,
+            size,
         } => {
-            let local_state = file_states.get(&path);
-            let needs_content = match local_state {
-                Some(state) => state.hash != hash,
-                None => true,
-            };
-            if needs_content {
-                transport.send(Message::RequestContent { path }).await?;
-            }
+            // CLI is about to push this file via scp — add to suppress set
+            suppress_set.insert(path.clone(), Instant::now());
+            debug!("file incoming via scp: {path} (size {size})");
         }
         Message::FileDeleted { path } => {
             let full_path = watch_dir.join(&path);
@@ -172,6 +187,11 @@ async fn handle_message(
                 let _ = std::fs::remove_dir_all(&full_path);
                 file_states.retain(|k, _| !k.starts_with(&path));
             }
+        }
+        Message::ManifestAck => {
+            // CLI finished initial sync — send our ack back
+            transport.send(Message::ManifestAck).await?;
+            info!("initial sync complete");
         }
         Message::Shutdown => {
             info!("received shutdown, exiting");
@@ -199,38 +219,10 @@ async fn handle_manifest(
     let local_map: HashMap<&str, &ManifestEntry> =
         local_entries.iter().map(|e| (e.path.as_str(), e)).collect();
 
-    // Files we have that remote doesn't — send them
-    for entry in &local_entries {
-        if entry.is_dir {
-            continue;
-        }
-        if !remote_map.contains_key(entry.path.as_str()) {
-            send_file_content(&entry.path, transport, watch_dir).await?;
-            file_states.insert(
-                entry.path.clone(),
-                FileState {
-                    hash: entry.hash,
-                    mtime: entry.mtime,
-                    size: entry.size,
-                },
-            );
-        } else {
-            let remote = remote_map[entry.path.as_str()];
-            if remote.hash != entry.hash {
-                send_file_content(&entry.path, transport, watch_dir).await?;
-            }
-            file_states.insert(
-                entry.path.clone(),
-                FileState {
-                    hash: entry.hash,
-                    mtime: entry.mtime,
-                    size: entry.size,
-                },
-            );
-        }
-    }
+    let mut to_push: Vec<SyncEntry> = Vec::new(); // CLI should push these to us
+    let mut to_pull: Vec<SyncEntry> = Vec::new(); // CLI should pull these from us
 
-    // Files remote has that we don't — request them
+    // Files remote (CLI) has that we don't — CLI should push them
     for entry in &remote_entries {
         if entry.is_dir {
             let dir_path = watch_dir.join(&entry.path);
@@ -238,24 +230,79 @@ async fn handle_manifest(
             continue;
         }
         if !local_map.contains_key(entry.path.as_str()) {
-            transport
-                .send(Message::RequestContent {
+            if entry.size <= INLINE_THRESHOLD {
+                // Will be pushed inline — nothing to add to plan
+            } else {
+                to_push.push(SyncEntry {
                     path: entry.path.clone(),
-                })
-                .await?;
+                    hash: entry.hash,
+                    size: entry.size,
+                });
+            }
+        } else {
+            let local = local_map[entry.path.as_str()];
+            if local.hash != entry.hash {
+                // Different versions — for now, CLI wins during initial sync
+                if entry.size <= INLINE_THRESHOLD {
+                    // Will handle inline
+                } else {
+                    to_push.push(SyncEntry {
+                        path: entry.path.clone(),
+                        hash: entry.hash,
+                        size: entry.size,
+                    });
+                }
+            }
         }
     }
 
-    transport.send(Message::ManifestAck).await?;
+    // Files we have that remote doesn't — CLI should pull them
+    for entry in &local_entries {
+        if entry.is_dir {
+            continue;
+        }
+        if !remote_map.contains_key(entry.path.as_str()) {
+            if entry.size <= INLINE_THRESHOLD {
+                // Send inline now
+                send_file_inline(&entry.path, transport, watch_dir).await?;
+            } else {
+                to_pull.push(SyncEntry {
+                    path: entry.path.clone(),
+                    hash: entry.hash,
+                    size: entry.size,
+                });
+            }
+        }
+    }
+
+    // Update file states for local files
+    for entry in &local_entries {
+        if !entry.is_dir {
+            file_states.insert(
+                entry.path.clone(),
+                FileState {
+                    hash: entry.hash,
+                    mtime: entry.mtime,
+                    size: entry.size,
+                },
+            );
+        }
+    }
+
+    // Send the sync plan
+    transport
+        .send(Message::SyncPlan { to_push, to_pull })
+        .await?;
+
     info!(
-        "manifest sync complete: {} local, {} remote",
+        "manifest processed: {} local, {} remote entries",
         local_entries.len(),
         remote_entries.len()
     );
     Ok(())
 }
 
-async fn send_file_content(path: &str, transport: &Transport, watch_dir: &Path) -> Result<()> {
+async fn send_file_inline(path: &str, transport: &Transport, watch_dir: &Path) -> Result<()> {
     let full_path = watch_dir.join(path);
     let data = match std::fs::read(&full_path) {
         Ok(d) => d,
@@ -264,41 +311,21 @@ async fn send_file_content(path: &str, transport: &Transport, watch_dir: &Path) 
             return Ok(());
         }
     };
-
     let hash = hash_content(&data);
-    let len = data.len();
 
-    if len <= 1024 * 1024 {
-        transport
-            .send(Message::FileContent {
-                path: path.to_string(),
-                hash,
-                data,
-            })
-            .await?;
-    } else {
-        for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
-            let offset = (i * CHUNK_SIZE) as u64;
-            let final_chunk = offset as usize + chunk.len() >= len;
-            transport
-                .send(Message::FileContentChunk {
-                    path: path.to_string(),
-                    offset,
-                    data: chunk.to_vec(),
-                    final_chunk,
-                })
-                .await?;
-            if i % 16 == 15 {
-                tokio::task::yield_now().await;
-            }
-        }
-    }
+    transport
+        .send(Message::FileContent {
+            path: path.to_string(),
+            hash,
+            data,
+        })
+        .await?;
 
-    debug!("sent: {path} ({len} bytes)");
+    debug!("sent inline: {path}");
     Ok(())
 }
 
-async fn write_file(
+fn write_file(
     path: &str,
     data: &[u8],
     hash: u64,
@@ -312,7 +339,6 @@ async fn write_file(
         std::fs::create_dir_all(parent)?;
     }
 
-    // Atomic write: temp + rename
     let tmp_path = full_path.with_extension("beamup-tmp");
     std::fs::write(&tmp_path, data)?;
     std::fs::rename(&tmp_path, &full_path)?;
@@ -337,54 +363,6 @@ async fn write_file(
     );
 
     debug!("wrote: {path} ({} bytes)", data.len());
-    Ok(())
-}
-
-async fn append_chunk(
-    path: &str,
-    offset: u64,
-    data: &[u8],
-    final_chunk: bool,
-    watch_dir: &Path,
-    file_states: &mut HashMap<String, FileState>,
-    suppress_set: &mut HashMap<String, Instant>,
-) -> Result<()> {
-    let full_path = watch_dir.join(path);
-    let tmp_path = full_path.with_extension("beamup-chunk-tmp");
-
-    if let Some(parent) = full_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&tmp_path)?;
-    use std::io::Seek;
-    file.seek(std::io::SeekFrom::Start(offset))?;
-    file.write_all(data)?;
-
-    if final_chunk {
-        drop(file);
-        std::fs::rename(&tmp_path, &full_path)?;
-        suppress_set.insert(path.to_string(), Instant::now());
-
-        let content = std::fs::read(&full_path)?;
-        let hash = hash_content(&content);
-        let size = content.len() as u64;
-        let mtime = full_path
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::now())
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        file_states.insert(path.to_string(), FileState { hash, mtime, size });
-        debug!("wrote chunked: {path} ({size} bytes)");
-    }
-
     Ok(())
 }
 
@@ -475,11 +453,12 @@ async fn handle_watch_event(
                 return Ok(());
             }
             let full_path = watch_dir.join(&path);
-            let data = match std::fs::read(&full_path) {
-                Ok(d) => d,
+            let metadata = match full_path.metadata() {
+                Ok(m) => m,
                 Err(_) => return Ok(()),
             };
-            let hash = hash_content(&data);
+            let size = metadata.len();
+            let hash = hash_file(&full_path).unwrap_or(0);
 
             if let Some(state) = file_states.get(&path) {
                 if state.hash == hash {
@@ -487,25 +466,39 @@ async fn handle_watch_event(
                 }
             }
 
-            let metadata = full_path.metadata()?;
             let mtime = metadata
                 .modified()
                 .unwrap_or(SystemTime::now())
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let size = metadata.len();
 
             file_states.insert(path.clone(), FileState { hash, mtime, size });
 
-            transport
-                .send(Message::FileChanged {
-                    path,
-                    hash,
-                    mtime,
-                    size,
-                })
-                .await?;
+            if size <= INLINE_THRESHOLD {
+                // Send small file inline
+                let data = match std::fs::read(&full_path) {
+                    Ok(d) => d,
+                    Err(_) => return Ok(()),
+                };
+                transport
+                    .send(Message::FileContent {
+                        path,
+                        hash,
+                        data,
+                    })
+                    .await?;
+            } else {
+                // Notify CLI — it will pull via scp
+                transport
+                    .send(Message::FileChanged {
+                        path,
+                        hash,
+                        mtime,
+                        size,
+                    })
+                    .await?;
+            }
         }
         WatchEvent::Deleted(path) => {
             if suppress_set.contains_key(&path) {

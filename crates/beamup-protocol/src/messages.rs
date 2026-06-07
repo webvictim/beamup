@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Threshold below which files are sent inline via the pipe.
+/// Above this, scp is used for transfer.
+pub const INLINE_THRESHOLD: u64 = 64 * 1024; // 64 KB
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
@@ -15,8 +19,14 @@ pub enum Message {
     FileManifest {
         entries: Vec<ManifestEntry>,
     },
+    /// Agent's response to FileManifest — tells CLI what to push/pull via scp
+    SyncPlan {
+        to_push: Vec<SyncEntry>,
+        to_pull: Vec<SyncEntry>,
+    },
     ManifestAck,
 
+    /// A file changed (metadata only — used to trigger scp or inline transfer)
     FileChanged {
         path: String,
         hash: u64,
@@ -33,19 +43,24 @@ pub enum Message {
         path: String,
     },
 
-    RequestContent {
-        path: String,
-    },
+    /// Small file sent inline (< INLINE_THRESHOLD)
     FileContent {
         path: String,
         hash: u64,
         data: Vec<u8>,
     },
-    FileContentChunk {
+
+    /// CLI finished scp'ing a file to the beam — agent should update state
+    FileReady {
         path: String,
-        offset: u64,
-        data: Vec<u8>,
-        final_chunk: bool,
+        hash: u64,
+        size: u64,
+    },
+
+    /// CLI finished pulling a file from the beam — agent can update bookkeeping
+    FileReceived {
+        path: String,
+        hash: u64,
     },
 
     ConflictDetected {
@@ -67,6 +82,13 @@ pub struct ManifestEntry {
     pub mtime: u64,
     pub size: u64,
     pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncEntry {
+    pub path: String,
+    pub hash: u64,
+    pub size: u64,
 }
 
 impl Message {

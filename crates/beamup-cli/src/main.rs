@@ -2,6 +2,7 @@ mod beam;
 mod commands;
 mod config;
 mod syncer;
+mod transfer;
 mod transport;
 mod watcher;
 

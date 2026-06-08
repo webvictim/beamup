@@ -26,3 +26,5 @@ indicatif = "0.17"
 crossterm = "0.28"
 directories = "5"
 futures-util = { version = "0.3", features = ["sink"] }
+tar = { workspace = true }
+flate2 = { workspace = true }

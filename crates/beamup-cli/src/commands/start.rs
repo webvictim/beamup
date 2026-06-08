@@ -33,6 +33,10 @@ pub struct StartArgs {
     /// Additional exclude patterns
     #[arg(long)]
     pub exclude: Vec<String>,
+
+    /// Chunk size in MB for large file transfers (default: 64)
+    #[arg(long, default_value = "64")]
+    pub chunk_size: usize,
 }
 
 pub async fn run(args: StartArgs) -> Result<()> {
@@ -71,9 +75,11 @@ pub async fn run(args: StartArgs) -> Result<()> {
     info!("deploying agent to beam...");
     Beam::deploy_agent(&beam_id, args.concurrency).await?;
 
+    let chunk_size_bytes = args.chunk_size * 1024 * 1024;
+
     info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
 
     let mut engine =
-        SyncEngine::new(beam_id, local_dir, args.remote_dir, args.concurrency).await?;
+        SyncEngine::new(beam_id, local_dir, args.remote_dir, args.concurrency, chunk_size_bytes).await?;
     engine.run().await
 }

@@ -36,6 +36,7 @@ pub struct SyncEngine {
     file_states: HashMap<String, FileState>,
     suppress_set: HashMap<String, Instant>,
     in_flight: HashSet<String>,
+    chunk_size: usize,
 }
 
 impl SyncEngine {
@@ -44,6 +45,7 @@ impl SyncEngine {
         local_dir: PathBuf,
         remote_dir: String,
         concurrency: usize,
+        chunk_size: usize,
     ) -> Result<Self> {
         let mut child = Beam::spawn_agent(&beam_id, &remote_dir)?;
 
@@ -57,6 +59,7 @@ impl SyncEngine {
             local_dir.clone(),
             remote_dir.clone(),
             concurrency,
+            chunk_size,
         );
 
         Ok(Self {
@@ -69,6 +72,7 @@ impl SyncEngine {
             file_states: HashMap::new(),
             suppress_set: HashMap::new(),
             in_flight: HashSet::new(),
+            chunk_size,
         })
     }
 
@@ -94,8 +98,21 @@ impl SyncEngine {
 
         // Initial sync
         info!("performing initial sync...");
-        self.initial_sync().await?;
-        info!("initial sync complete");
+        let sync_start = Instant::now();
+        let sync_bytes = self.initial_sync().await?;
+        let sync_duration = sync_start.elapsed();
+        let sync_secs = sync_duration.as_secs_f64();
+        let bw = if sync_secs > 0.0 {
+            sync_bytes as f64 / sync_secs / 1024.0 / 1024.0
+        } else {
+            0.0
+        };
+        info!(
+            "initial sync complete: {} in {:.1}s ({:.1} MB/s)",
+            format_size(sync_bytes),
+            sync_secs,
+            bw
+        );
 
         // Start local watcher
         let mut watcher = FsWatcher::new(&self.local_dir, &self.ignore_rules)?;
@@ -145,7 +162,9 @@ impl SyncEngine {
         Ok(())
     }
 
-    async fn initial_sync(&mut self) -> Result<()> {
+    async fn initial_sync(&mut self) -> Result<u64> {
+        let mut total_bytes: u64 = 0;
+
         // Build and send our manifest
         let manifest = self.build_local_manifest()?;
         let entry_count = manifest.len();
@@ -161,7 +180,7 @@ impl SyncEngine {
                     break (to_push, to_pull);
                 }
                 Some(Message::FileContent { path, hash, data }) => {
-                    // Agent sends small files inline during initial sync
+                    total_bytes += data.len() as u64;
                     self.write_local_file_inline(&path, &data, hash)?;
                 }
                 Some(other) => {
@@ -175,31 +194,61 @@ impl SyncEngine {
         let pull_count = to_pull.len();
         info!("sync plan: push {push_count} files, pull {pull_count} files");
 
-        // Split pushes into inline (small) and scp (large)
+        // Push files: tar batch for all files <= chunk_size, chunked scp for huge files
         if !to_push.is_empty() {
-            let (small, large): (Vec<_>, Vec<_>) = to_push
-                .iter()
-                .partition(|e| e.size <= INLINE_THRESHOLD);
-
-            // Send small files inline
-            for entry in &small {
-                let full_path = self.local_dir.join(&entry.path);
-                if let Ok(data) = std::fs::read(&full_path) {
-                    let hash = beamup_protocol::hash::hash_content(&data);
-                    self.transport
-                        .send(Message::FileContent {
-                            path: entry.path.clone(),
-                            hash,
-                            data,
-                        })
-                        .await?;
+            let mut tar_files = Vec::new();
+            let mut huge = Vec::new();
+            for entry in &to_push {
+                if entry.size <= self.chunk_size as u64 {
+                    tar_files.push(entry);
+                } else {
+                    huge.push(entry);
                 }
             }
 
-            // Push large files via scp
-            if !large.is_empty() {
-                let paths: Vec<String> = large.iter().map(|e| e.path.clone()).collect();
+            // Push all normal files via tar batches (parallel pipes)
+            if !tar_files.is_empty() {
+                let paths: Vec<String> = tar_files.iter().map(|e| e.path.clone()).collect();
+                let sizes: Vec<u64> = tar_files.iter().map(|e| e.size).collect();
+                let tar_total: u64 = sizes.iter().sum();
+                info!("pushing {} files via tar ({})", paths.len(), format_size(tar_total));
+                let results = self.transfer_pool.push_batch_tar(paths, sizes).await;
+                total_bytes += tar_total;
+                let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
+                if !failures.is_empty() {
+                    warn!("{} tar push failures", failures.len());
+                }
+
+                for entry in &tar_files {
+                    self.transport
+                        .send(Message::FileReady {
+                            path: entry.path.clone(),
+                            hash: entry.hash,
+                            size: entry.size,
+                        })
+                        .await?;
+                }
+                info!("sent {} FileReady notifications", tar_files.len());
+            }
+
+            // Push huge files via chunked scp
+            if !huge.is_empty() {
+                let huge_total: u64 = huge.iter().map(|e| e.size).sum();
+                info!(
+                    "pushing {} large files via chunked scp ({})",
+                    huge.len(),
+                    format_size(huge_total)
+                );
+                for entry in &huge {
+                    info!("  chunked: {} ({})", entry.path, format_size(entry.size));
+                }
+                let paths: Vec<String> = huge.iter().map(|e| e.path.clone()).collect();
                 let results = self.transfer_pool.push_batch(paths).await;
+                for r in &results {
+                    if r.success {
+                        total_bytes += r.bytes;
+                    }
+                }
                 let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
                 if !failures.is_empty() {
                     for f in &failures {
@@ -208,7 +257,7 @@ impl SyncEngine {
                     warn!("{} push failures", failures.len());
                 }
 
-                for entry in &large {
+                for entry in &huge {
                     self.transport
                         .send(Message::FileReady {
                             path: entry.path.clone(),
@@ -220,16 +269,48 @@ impl SyncEngine {
             }
         }
 
-        // Execute pulls in parallel
+        // Pull files: tar batch for all files <= chunk_size, chunked scp for huge files
         if !to_pull.is_empty() {
-            let paths: Vec<String> = to_pull.iter().map(|e| e.path.clone()).collect();
-            let results = self.transfer_pool.pull_batch(paths).await;
-            let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
-            if !failures.is_empty() {
-                for f in &failures {
-                    warn!("pull failed: {} — {:?}", f.path, f.error);
+            let mut tar_files = Vec::new();
+            let mut huge_pull = Vec::new();
+            for entry in &to_pull {
+                if entry.size <= self.chunk_size as u64 {
+                    tar_files.push(entry);
+                } else {
+                    huge_pull.push(entry);
                 }
-                warn!("{} pull failures", failures.len());
+            }
+
+            // Pull normal files via tar batch
+            if !tar_files.is_empty() {
+                let paths: Vec<String> = tar_files.iter().map(|e| e.path.clone()).collect();
+                let sizes: Vec<u64> = tar_files.iter().map(|e| e.size).collect();
+                let pull_total: u64 = sizes.iter().sum();
+                info!("pulling {} files via tar ({})", paths.len(), format_size(pull_total));
+                let results = self.transfer_pool.pull_batch_tar(paths, sizes).await;
+                total_bytes += pull_total;
+                let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
+                if !failures.is_empty() {
+                    warn!("{} tar pull failures", failures.len());
+                }
+            }
+
+            // Pull huge files via chunked scp
+            if !huge_pull.is_empty() {
+                let paths: Vec<String> = huge_pull.iter().map(|e| e.path.clone()).collect();
+                let results = self.transfer_pool.pull_batch(paths).await;
+                for r in &results {
+                    if r.success {
+                        total_bytes += r.bytes;
+                    }
+                }
+                let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
+                if !failures.is_empty() {
+                    for f in &failures {
+                        warn!("pull failed: {} — {:?}", f.path, f.error);
+                    }
+                    warn!("{} pull failures", failures.len());
+                }
             }
 
             // Update local state for pulled files
@@ -268,21 +349,28 @@ impl SyncEngine {
         }
 
         // Exchange ManifestAck
+        info!("sending ManifestAck, waiting for agent...");
         self.transport.send(Message::ManifestAck).await?;
 
         // Wait for agent's ManifestAck
+        let mut ack_inline_count = 0u64;
         loop {
             match self.transport.recv().await? {
                 Some(Message::ManifestAck) => break,
                 Some(Message::FileContent { path, hash, data }) => {
+                    ack_inline_count += 1;
+                    total_bytes += data.len() as u64;
                     self.write_local_file_inline(&path, &data, hash)?;
                 }
                 Some(_) => {}
                 None => anyhow::bail!("transport closed waiting for ManifestAck"),
             }
         }
+        if ack_inline_count > 0 {
+            info!("received {ack_inline_count} inline files from agent during ack");
+        }
 
-        Ok(())
+        Ok(total_bytes)
     }
 
     async fn handle_remote_message(&mut self, msg: Message) -> Result<()> {
@@ -634,4 +722,16 @@ fn uuid_simple() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{:x}", ts)
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }

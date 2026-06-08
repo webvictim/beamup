@@ -30,9 +30,8 @@ impl IgnoreRules {
             }
         }
 
-        // Always ignore .git directory and beamup internals
+        // Always ignore beamup internals
         let mut builder = GitignoreBuilder::new(root);
-        let _ = builder.add_line(None, ".git");
         let _ = builder.add_line(None, "*.beamup-tmp");
         let _ = builder.add_line(None, "*.beamup-pull-tmp");
         let _ = builder.add_line(None, "*.beamup-chunk-*");
@@ -86,18 +85,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn ignores_git_directory() {
-        let root = setup_test_dir("ignore-git");
-        let rules = IgnoreRules::load(&root);
-
-        assert!(rules.is_ignored(Path::new(".git"), true));
-        assert!(rules.is_ignored(Path::new(".git/objects/abc123"), false));
-        assert!(rules.is_ignored(Path::new(".git/HEAD"), false));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -190,6 +177,7 @@ mod tests {
     #[test]
     fn filter_path_strips_prefix() {
         let root = setup_test_dir("ignore-filter-path");
+        fs::write(root.join(".beamignore"), ".git\n").unwrap();
         let rules = IgnoreRules::load(&root);
 
         let full_path = root.join(".git/HEAD");

@@ -25,6 +25,10 @@ pub struct SyncArgs {
     /// Max concurrent scp transfers
     #[arg(short, long, default_value = "8")]
     pub concurrency: usize,
+
+    /// Chunk size in MB for large file transfers (default: 64)
+    #[arg(long, default_value = "64")]
+    pub chunk_size: usize,
 }
 
 pub async fn run(args: SyncArgs) -> Result<()> {
@@ -62,7 +66,8 @@ pub async fn run(args: SyncArgs) -> Result<()> {
 
     info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
 
+    let chunk_size_bytes = args.chunk_size * 1024 * 1024;
     let mut engine =
-        SyncEngine::new(beam_id, local_dir, args.remote_dir, args.concurrency).await?;
+        SyncEngine::new(beam_id, local_dir, args.remote_dir, args.concurrency, chunk_size_bytes).await?;
     engine.run().await
 }

@@ -37,6 +37,10 @@ struct Args {
     #[arg(long)]
     decompress_chunks: Option<PathBuf>,
 
+    /// Chunk size in bytes for compression
+    #[arg(long)]
+    chunk_size: Option<usize>,
+
     /// Positional arguments (varies by mode)
     #[arg(trailing_var_arg = true)]
     positional: Vec<String>,
@@ -94,10 +98,12 @@ async fn main() -> Result<()> {
             .first()
             .ok_or_else(|| anyhow::anyhow!("--compress requires: <file> <file_id>"))?;
 
+        let chunk_size = args.chunk_size.unwrap_or(compress::CHUNK_SIZE);
+
         let metadata = std::fs::metadata(&input)?;
         let file_size = metadata.len();
 
-        if file_size <= compress::CHUNKED_THRESHOLD {
+        if file_size <= chunk_size as u64 {
             println!("0");
             return Ok(());
         }
@@ -107,7 +113,7 @@ async fn main() -> Result<()> {
 
         let mut file = std::fs::File::open(&input)?;
         let mut chunk_idx = 0;
-        let mut buf = vec![0u8; compress::CHUNK_SIZE];
+        let mut buf = vec![0u8; chunk_size];
 
         loop {
             let bytes_read = file.read(&mut buf)?;

@@ -8,8 +8,8 @@ pub fn decompress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     decompress_size_prepended(data).map_err(|e| anyhow::anyhow!("lz4 decompress failed: {e}"))
 }
 
-/// Chunk size for parallel transfer (8MB)
-pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+/// Default chunk size for parallel transfer (64MB)
+pub const CHUNK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Minimum file size to trigger chunked transfer (anything above inline threshold
 /// that's also larger than one chunk gets split)

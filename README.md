@@ -31,7 +31,7 @@ Or with a musl cross-compiler installed locally:
 cargo build --release --target aarch64-unknown-linux-musl -p beamup-agent
 ```
 
-Set `BEAMUP_AGENT_PATH` to the resulting agent binary, or place it next to the `beamup` binary.
+The build script strips the binary and pre-compresses it for faster deployment.
 
 ## Usage
 
@@ -44,6 +44,15 @@ beamup start --beam kinetic-vault
 
 # Sync a specific directory
 beamup start --path ~/projects/myapp
+
+# Start sync and immediately drop into a console on the beam
+beamup start --console
+
+# One-way sync: push local to beam, then only pull back changes
+beamup start --initial-sync local-to-beam --ongoing-sync beam-to-local
+
+# Push-only sync (no changes pulled back from beam)
+beamup start --initial-sync local-to-beam --ongoing-sync local-to-beam
 
 # Check sync status
 beamup status
@@ -58,15 +67,32 @@ beamup down
 beamup down --keep-beam
 ```
 
+## Sync direction
+
+By default, beamup syncs bidirectionally. You can control the direction independently for the initial sync and ongoing sync:
+
+| Flag | Values | Default |
+|------|--------|---------|
+| `--initial-sync` | `local-to-beam`, `beam-to-local`, `bidirectional` | `bidirectional` |
+| `--ongoing-sync` | `local-to-beam`, `beam-to-local`, `bidirectional` | `bidirectional` |
+
+Common patterns:
+- **Dev on beam**: `--initial-sync local-to-beam --ongoing-sync bidirectional` — push code up, then sync both ways
+- **Build on beam**: `--initial-sync local-to-beam --ongoing-sync beam-to-local` — push code up, only pull back artifacts
+- **Push-only mirror**: `--ongoing-sync local-to-beam` — beam is a read-only mirror of local
+
 ## Features
 
 - **Bidirectional sync** — local edits push to beam, beam edits pull to local
+- **Configurable direction** — one-way or bidirectional, independently for initial and ongoing sync
+- **Progress bar** — real-time transfer progress with per-chunk updates, transfer rate, and ETA
+- **Console mode** — `--console` drops you into a beam shell after sync completes
 - **Near-realtime** — sub-second propagation via OS-native file watching
 - **Conflict detection** — when both sides edit the same file, both versions are preserved (`.local.conflict` suffix) and the user is alerted
 - **Respects .gitignore** — plus an optional `.beamignore` for additional exclusions
 - **Atomic writes** — write-to-temp-then-rename prevents partial file corruption
 - **Heartbeat monitoring** — detects beam death within 15 seconds
-- **Reconnection** — buffers local changes during disconnects, resyncs on reconnect
+- **Large file chunking** — files over 64MB are split into chunks, compressed, and transferred in parallel
 
 ## Architecture
 

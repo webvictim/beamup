@@ -6,16 +6,18 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tracing::{debug, info};
 
-fn agent_binary_path() -> Result<PathBuf> {
-    // Check env var first (for development)
+const EMBEDDED_AGENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/beamup-agent-embedded"));
+
+fn agent_binary_path() -> Result<AgentBinary> {
+    // Check env var first (for development override)
     if let Ok(path) = std::env::var("BEAMUP_AGENT_PATH") {
         let p = PathBuf::from(path);
         if p.exists() {
-            return Ok(p);
+            return Ok(AgentBinary::Path(p));
         }
     }
 
-    // Check workspace target directory (development) — prefer cross-compiled Linux binary
+    // Check workspace target directory (development)
     let candidates = [
         "target/aarch64-unknown-linux-musl/release/beamup-agent",
         "target/aarch64-unknown-linux-musl/debug/beamup-agent",
@@ -23,15 +25,20 @@ fn agent_binary_path() -> Result<PathBuf> {
     for candidate in &candidates {
         let p = PathBuf::from(candidate);
         if p.exists() {
-            return Ok(p);
+            return Ok(AgentBinary::Path(p));
         }
+    }
+
+    // Use embedded binary if available (non-empty)
+    if !EMBEDDED_AGENT.is_empty() {
+        return Ok(AgentBinary::Embedded(EMBEDDED_AGENT));
     }
 
     // Check next to our own binary (for installed/packaged deployments)
     if let Ok(exe) = std::env::current_exe() {
         let sibling = exe.parent().unwrap_or(exe.as_ref()).join("beamup-agent");
         if sibling.exists() {
-            return Ok(sibling);
+            return Ok(AgentBinary::Path(sibling));
         }
     }
 
@@ -40,6 +47,29 @@ fn agent_binary_path() -> Result<PathBuf> {
          cross build --target aarch64-unknown-linux-musl -p beamup-agent\n\
          Or set BEAMUP_AGENT_PATH to point to the binary."
     )
+}
+
+enum AgentBinary {
+    Path(PathBuf),
+    Embedded(&'static [u8]),
+}
+
+impl AgentBinary {
+    fn to_path(&self) -> Result<PathBuf> {
+        match self {
+            AgentBinary::Path(p) => Ok(p.clone()),
+            AgentBinary::Embedded(data) => {
+                let tmp = std::env::temp_dir().join("beamup-agent");
+                std::fs::write(&tmp, data)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+                }
+                Ok(tmp)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,7 +144,8 @@ impl Beam {
     }
 
     pub async fn deploy_agent(beam_id: &str, concurrency: usize) -> Result<()> {
-        let agent_path = agent_binary_path()?;
+        let agent = agent_binary_path()?;
+        let agent_path = agent.to_path()?;
         crate::transfer::deploy_agent_chunked(beam_id, &agent_path, concurrency).await
     }
 

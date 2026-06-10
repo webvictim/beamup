@@ -629,35 +629,24 @@ pub async fn deploy_agent_chunked(
     let size = agent_path.metadata()?.len();
 
     if size <= 50 * 1024 * 1024 {
-        // Small enough to transfer directly without compression
         info!("deploying agent: {} bytes", size);
         Beam::scp_to_beam(beam_id, agent_path, "/tmp/beamup-agent").await?;
         Beam::exec_shell(beam_id, "chmod +x /tmp/beamup-agent").await?;
     } else {
-        // Large binary — compress before transfer
         use std::io::Write;
         use flate2::write::GzEncoder;
         use flate2::Compression;
 
-        let gz_path = agent_path.with_extension("gz");
+        let data = std::fs::read(agent_path)?;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&data)?;
+        let compressed = encoder.finish()?;
+        let compressed_size = compressed.len();
+        let ratio = size as f64 / compressed_size as f64;
+        info!("deploying agent: {size} bytes -> {compressed_size} bytes compressed ({ratio:.1}x)");
+
         let local_tmp = std::env::temp_dir().join("beamup-agent-deploy.gz");
-
-        if gz_path.exists() {
-            let gz_size = gz_path.metadata()?.len();
-            let ratio = size as f64 / gz_size as f64;
-            info!("deploying agent (pre-compressed): {size} bytes -> {gz_size} bytes ({ratio:.1}x)");
-            std::fs::copy(&gz_path, &local_tmp)?;
-        } else {
-            let data = std::fs::read(agent_path)?;
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-            encoder.write_all(&data)?;
-            let compressed = encoder.finish()?;
-            let compressed_size = compressed.len();
-            let ratio = size as f64 / compressed_size as f64;
-            info!("deploying agent: {size} bytes -> {compressed_size} bytes compressed ({ratio:.1}x)");
-            std::fs::write(&local_tmp, &compressed)?;
-        }
-
+        std::fs::write(&local_tmp, &compressed)?;
         Beam::scp_to_beam(beam_id, &local_tmp, "/tmp/beamup-agent.gz").await?;
         let _ = std::fs::remove_file(&local_tmp);
         Beam::exec_shell(beam_id, "gunzip -f /tmp/beamup-agent.gz && chmod +x /tmp/beamup-agent").await?;

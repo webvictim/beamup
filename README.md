@@ -31,7 +31,7 @@ Or with a musl cross-compiler installed locally:
 cargo build --release --target aarch64-unknown-linux-musl -p beamup-agent
 ```
 
-The build script strips the binary and pre-compresses it for faster deployment.
+The build script strips the binary for faster deployment.
 
 ## Usage
 

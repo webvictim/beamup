@@ -7,8 +7,8 @@ beamup is a bidirectional real-time file sync tool for Teleport Beams. It syncs 
 ## Build
 
 ```bash
-cargo build                    # CLI (macOS)
-./scripts/build-agent.sh       # Agent (linux/arm64, requires cross)
+./scripts/build.sh   # Full release build (cross-compiles agent, embeds in CLI)
+cargo build          # Dev build (CLI only, uses agent from target/ or embedded)
 ```
 
 ## Test
@@ -21,10 +21,10 @@ cargo build -p beamup-cli -p beamup-agent  # Verify both compile
 ## Run (development)
 
 ```bash
-cargo build && ./scripts/build-agent.sh && ./target/debug/beamup start -v --path ~/my-project
+cargo build && ./target/debug/beamup start -v --path ~/my-project
 ```
 
-The CLI auto-discovers the agent binary at `target/aarch64-unknown-linux-musl/release/beamup-agent`. Override with `BEAMUP_AGENT_PATH`.
+The build.rs auto-embeds the agent if found at `target/aarch64-unknown-linux-musl/release/beamup-agent`. Override with `BEAMUP_AGENT_PATH`. If no agent is found at build time, the CLI falls back to runtime lookup.
 
 ## Architecture
 

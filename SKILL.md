@@ -9,9 +9,8 @@ beamup syncs a local directory to a Teleport Beam in real-time. It deploys a sma
 ## Prerequisites
 
 - `tsh` CLI authenticated (`tsh login`)
-- beamup binary built: `cargo build -p beamup-cli`
-- Agent binary cross-compiled: `./scripts/build-agent.sh` (or `BEAMUP_AGENT_PATH` set)
-- The agent binary is at `target/aarch64-unknown-linux-musl/release/beamup-agent`
+- beamup built: `./scripts/build.sh` (produces a single `target/release/beamup` binary with agent embedded)
+- Or for development: `cargo build` (requires agent at `target/aarch64-unknown-linux-musl/release/beamup-agent`)
 
 ## Quick start
 

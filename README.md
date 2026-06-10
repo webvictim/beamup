@@ -16,22 +16,16 @@ Communication uses length-prefixed msgpack frames over stdin/stdout of the `tsh 
 ## Install
 
 ```bash
-cargo build --release
+./scripts/build.sh
 ```
 
-For the remote agent (requires [cross](https://github.com/cross-rs/cross)):
+This cross-compiles the agent for linux/arm64, embeds it into the CLI binary, and produces `target/release/beamup` — a single self-contained binary.
+
+Requires [cross](https://github.com/cross-rs/cross) for the agent cross-compilation. To build just the CLI without embedding (for development):
 
 ```bash
-./scripts/build-agent.sh
+cargo build
 ```
-
-Or with a musl cross-compiler installed locally:
-
-```bash
-cargo build --release --target aarch64-unknown-linux-musl -p beamup-agent
-```
-
-The build script strips the binary for faster deployment.
 
 ## Usage
 
@@ -119,7 +113,8 @@ crates/
 
 - `tsh` CLI with Beams support (authenticated via `tsh login`)
 - Rust toolchain for building
-- [cross](https://github.com/cross-rs/cross) (or `aarch64-linux-musl-gcc`) for cross-compiling the agent
+- [cross](https://github.com/cross-rs/cross) for cross-compiling the agent (`cargo install cross --git https://github.com/cross-rs/cross`)
+- Docker (required by `cross` to run the linux/arm64 build container)
 
 ## License
 

@@ -11,5 +11,13 @@ if command -v aarch64-linux-musl-strip &> /dev/null; then
     echo "Stripped binary."
 fi
 
-SIZE=$(du -h "$BINARY" | cut -f1)
-echo "Agent binary: $BINARY ($SIZE)"
+AGENT_SIZE=$(du -h "$BINARY" | cut -f1)
+echo "Agent binary: $BINARY ($AGENT_SIZE)"
+
+echo ""
+echo "Building beamup CLI (embedding agent)..."
+cargo build --release -p beamup-cli
+
+CLI_BINARY="target/release/beamup"
+CLI_SIZE=$(du -h "$CLI_BINARY" | cut -f1)
+echo "CLI binary: $CLI_BINARY ($CLI_SIZE)"

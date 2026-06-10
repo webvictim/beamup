@@ -45,7 +45,7 @@ beamup start
 beamup start --beam kinetic-vault
 
 # Sync a specific directory
-beamup start --path ~/projects/myapp
+beamup start --local-path ~/projects/myapp
 
 # Start sync and immediately drop into a console on the beam
 beamup start --console

@@ -21,7 +21,7 @@ cargo build -p beamup-cli -p beamup-agent  # Verify both compile
 ## Run (development)
 
 ```bash
-cargo build && ./target/debug/beamup start -v --path ~/my-project
+cargo build && ./target/debug/beamup start -v --local-path ~/my-project
 ```
 
 The build.rs auto-embeds the agent if found at `target/aarch64-unknown-linux-musl/release/beamup-agent`. Override with `BEAMUP_AGENT_PATH`. If no agent is found at build time, the CLI falls back to runtime lookup.

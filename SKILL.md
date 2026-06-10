@@ -22,7 +22,7 @@ beamup start
 beamup start --console
 
 # Sync a specific directory
-beamup start --path ~/projects/myapp
+beamup start --local-path ~/projects/myapp
 
 # Use an existing beam
 beamup start --beam kinetic-vault
@@ -88,7 +88,7 @@ beamup respects `.gitignore` and an optional `.beamignore` file (same syntax). A
 
 ## Remote directory
 
-Files sync to `/home/beams/sync` on the beam by default (override with `--remote-dir`). Connect to the beam with:
+Files sync to `/home/beams/sync` on the beam by default (override with `--remote-path`). Connect to the beam with:
 
 ```bash
 tsh beams console <beam-name>

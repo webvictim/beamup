@@ -1,5 +1,5 @@
 ---
-description: Syncing files to Teleport Beams with beamup — a real-time bidirectional file sync tool. Use when syncing a local directory to a beam for development, builds, or running code remotely. Covers sync setup, direction control, console mode, and troubleshooting.
+description: Syncing files to Teleport Beams with beamup — a real-time bidirectional file sync tool. Use when syncing a local directory to a beam for development, builds, or running code remotely. Covers sync setup, direction control, oneshot mode for agents, Machine ID authentication, and troubleshooting.
 ---
 
 # beamup skill
@@ -8,11 +8,35 @@ beamup syncs a local directory to a Teleport Beam in real-time. It deploys a sma
 
 ## Prerequisites
 
-- `tsh` CLI authenticated (`tsh login`)
+- `tsh` CLI authenticated (`tsh login`) — or a Machine ID identity file for headless use
 - beamup built: `./scripts/build.sh` (produces a single `target/release/beamup` binary with agent embedded)
-- Or for development: `cargo build` (requires agent at `target/aarch64-unknown-linux-musl/release/beamup-agent`)
+- Or install via Homebrew: `brew install webvictim/tap/beamup`
 
-## Quick start
+## Agent / automation usage (oneshot mode)
+
+When an agent needs to provision a beam with a file structure before running commands on it, use `-q` and `--oneshot`. This suppresses all log output and prints only the beam name to stdout after the initial sync completes:
+
+```bash
+# Create a beam, sync files, print beam name, exit
+BEAM=$(beamup -q start --oneshot --local-path ~/projects/myapp)
+tsh beams exec "$BEAM" -- make build
+```
+
+For headless environments (no interactive `tsh login`), combine with Machine ID:
+
+```bash
+BEAM=$(beamup -q -i /path/to/identity --proxy cluster.example.com:443 \
+  start --oneshot --local-path ~/projects/myapp)
+tsh -i /path/to/identity --proxy cluster.example.com:443 beams exec "$BEAM" -- make build
+```
+
+Key flags for agent use:
+- `-q` — suppress all log output (only errors to stderr)
+- `--oneshot` — exit after initial sync, print beam name to stdout
+- `-i <path>` — use a Machine ID identity file instead of interactive login
+- `--proxy <addr>` — Teleport proxy address (required with `-i`)
+
+## Interactive usage
 
 ```bash
 # Sync current directory to a new beam (bidirectional)
@@ -52,6 +76,10 @@ Values: `local-to-beam`, `beam-to-local`, `bidirectional`
 
 | Flag | Purpose |
 |------|---------|
+| `-q` / `--quiet` | Suppress all log output (errors only) |
+| `--oneshot` | Exit after initial sync, print beam name to stdout |
+| `-i` / `--identity <path>` | Teleport identity file (Machine ID / tbot) |
+| `--proxy <addr>` | Teleport proxy address (required with `--identity`) |
 | `--console` | Launch `tsh beams console` after initial sync |
 | `--initial-sync <dir>` | Direction for initial file reconciliation |
 | `--ongoing-sync <dir>` | Direction for ongoing change propagation |

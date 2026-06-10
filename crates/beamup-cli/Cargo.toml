@@ -19,7 +19,7 @@ rmp-serde = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 notify = "7"
 notify-debouncer-full = "0.4"
 indicatif = "0.17"

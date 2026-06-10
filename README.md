@@ -64,6 +64,12 @@ beamup start --initial-sync local-to-beam --ongoing-sync beam-to-local
 # Push-only sync (no changes pulled back from beam)
 beamup start --initial-sync local-to-beam --ongoing-sync local-to-beam
 
+# Oneshot mode: sync files, print beam name, exit (for scripting/agents)
+beamup -q start --oneshot --local-path ~/projects/myapp
+
+# Use a Machine ID identity file instead of interactive tsh login
+beamup -i /path/to/identity --proxy cluster.example.com:443 start --local-path ~/projects/myapp
+
 # Check sync status
 beamup status
 
@@ -76,6 +82,29 @@ beamup down
 # Stop syncing but keep the beam alive
 beamup down --keep-beam
 ```
+
+## Oneshot mode
+
+`--oneshot` performs the initial sync and exits immediately, printing only the beam name to stdout. Combined with `-q` (quiet), this suppresses all log output — making beamup usable as a tool that provisions a beam with a file structure for downstream automation.
+
+```bash
+# Create a beam, sync files, print beam name, exit
+BEAM=$(beamup -q start --oneshot --local-path ~/projects/myapp)
+echo "Beam ready: $BEAM"
+tsh beams exec "$BEAM" -- make build
+```
+
+`--oneshot` is mutually exclusive with `--ongoing-sync` (there is no ongoing sync in this mode).
+
+## Machine ID / identity file
+
+beamup supports Teleport Machine ID (`tbot`) for non-interactive authentication. Pass an identity file with `--identity` / `-i` and the proxy address with `--proxy`:
+
+```bash
+beamup -i /path/to/identity --proxy cluster.example.com:443 start --local-path ~/project
+```
+
+This is required for headless/automated usage where no interactive `tsh login` session exists. The `TELEPORT_IDENTITY_FILE` env var is also respected by `tsh` directly.
 
 ## Sync direction
 

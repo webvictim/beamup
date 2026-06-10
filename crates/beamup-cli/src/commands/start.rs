@@ -49,8 +49,12 @@ pub struct StartArgs {
     pub initial_sync: CliSyncDirection,
 
     /// Direction for ongoing sync
-    #[arg(long, value_enum, default_value = "bidirectional")]
+    #[arg(long, value_enum, default_value = "bidirectional", conflicts_with = "oneshot")]
     pub ongoing_sync: CliSyncDirection,
+
+    /// Exit after initial sync, printing the beam name to stdout
+    #[arg(long)]
+    pub oneshot: bool,
 }
 
 pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
@@ -103,6 +107,12 @@ pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
         args.ongoing_sync.into(),
     )
     .await?;
+
+    if args.oneshot {
+        engine.run_initial_sync_only().await?;
+        println!("{beam_id}");
+        return Ok(());
+    }
 
     if !args.console {
         return engine.run(None).await;

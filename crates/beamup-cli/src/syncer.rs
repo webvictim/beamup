@@ -85,6 +85,47 @@ impl SyncEngine {
         })
     }
 
+    pub async fn run_initial_sync_only(&mut self) -> Result<()> {
+        let session_id = uuid_simple();
+        self.transport
+            .send(Message::Hello {
+                version: PROTOCOL_VERSION,
+                session_id: session_id.clone(),
+                initial_direction: self.initial_direction,
+                ongoing_direction: self.ongoing_direction,
+            })
+            .await?;
+
+        match self.transport.recv().await? {
+            Some(Message::HelloAck { version }) => {
+                if version != PROTOCOL_VERSION {
+                    anyhow::bail!("agent protocol version mismatch: {version}");
+                }
+                info!("handshake complete");
+            }
+            other => anyhow::bail!("expected HelloAck, got: {other:?}"),
+        }
+
+        info!("performing initial sync...");
+        let sync_start = Instant::now();
+        let sync_bytes = self.initial_sync().await?;
+        let sync_duration = sync_start.elapsed();
+        let sync_secs = sync_duration.as_secs_f64();
+        let bw = if sync_secs > 0.0 {
+            sync_bytes as f64 / sync_secs / 1024.0 / 1024.0
+        } else {
+            0.0
+        };
+        info!(
+            "initial sync complete: {} in {:.1}s ({:.1} MB/s)",
+            format_size(sync_bytes),
+            sync_secs,
+            bw
+        );
+
+        Ok(())
+    }
+
     pub async fn run(&mut self, on_sync_complete: Option<oneshot::Sender<()>>) -> Result<()> {
         // Handshake
         let session_id = uuid_simple();

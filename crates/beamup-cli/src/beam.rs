@@ -1,12 +1,50 @@
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+static IDENTITY_FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
+static PROXY: OnceLock<Option<String>> = OnceLock::new();
+
+/// Set the identity file and proxy for all tsh invocations.
+pub fn set_identity_file(path: Option<PathBuf>, proxy: Option<String>) {
+    IDENTITY_FILE.get_or_init(|| path);
+    PROXY.get_or_init(|| proxy);
+}
+
+/// Build a tsh Command with identity/proxy args prepended if configured.
+fn tsh_command() -> Command {
+    let mut cmd = Command::new("tsh");
+    if let Some(Some(path)) = IDENTITY_FILE.get() {
+        cmd.arg("-i").arg(path);
+    }
+    if let Some(Some(proxy)) = PROXY.get() {
+        cmd.arg("--proxy").arg(proxy);
+    }
+    cmd
+}
+
+/// Build a std::process::Command (sync) with identity/proxy args prepended if configured.
+pub fn tsh_command_sync() -> std::process::Command {
+    let mut cmd = std::process::Command::new("tsh");
+    if let Some(Some(path)) = IDENTITY_FILE.get() {
+        cmd.arg("-i").arg(path);
+    }
+    if let Some(Some(proxy)) = PROXY.get() {
+        cmd.arg("--proxy").arg(proxy);
+    }
+    cmd
+}
 
 const EMBEDDED_AGENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/beamup-agent-embedded"));
+
+const MAX_RETRIES: u32 = 3;
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 fn agent_binary_path() -> Result<AgentBinary> {
     // Check env var first (for development override)
@@ -82,7 +120,7 @@ pub struct Beam;
 
 impl Beam {
     pub async fn create() -> Result<BeamInfo> {
-        let output = Command::new("tsh")
+        let output = tsh_command()
             .args(["beams", "add", "--format=json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -102,7 +140,7 @@ impl Beam {
     }
 
     pub async fn destroy(beam_id: &str) -> Result<()> {
-        let output = Command::new("tsh")
+        let output = tsh_command()
             .args(["beams", "rm", beam_id])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -120,7 +158,7 @@ impl Beam {
     }
 
     pub async fn list() -> Result<Vec<BeamInfo>> {
-        let output = Command::new("tsh")
+        let output = tsh_command()
             .args(["beams", "ls", "--format=json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -150,7 +188,7 @@ impl Beam {
     }
 
     pub fn spawn_agent(beam_id: &str, remote_dir: &str) -> Result<tokio::process::Child> {
-        let child = Command::new("tsh")
+        let child = tsh_command()
             .args([
                 "beams", "exec", beam_id, "--",
                 "/tmp/beamup-agent", "--serve", "--watch-dir", remote_dir,
@@ -170,7 +208,7 @@ impl Beam {
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
         args.extend(cmd_refs);
 
-        let status = Command::new("tsh")
+        let status = tsh_command()
             .args(&args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -183,7 +221,7 @@ impl Beam {
     }
 
     pub async fn console(beam_id: &str) -> Result<ExitStatus> {
-        let status = Command::new("tsh")
+        let status = tsh_command()
             .args(["beams", "console", beam_id])
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -195,86 +233,128 @@ impl Beam {
         Ok(status)
     }
 
-    /// scp a local file to the beam
+    /// scp a local file to the beam (with retry)
     pub async fn scp_to_beam(beam_id: &str, local_path: &Path, remote_path: &str) -> Result<()> {
         let dest = format!("{beam_id}:{remote_path}");
-        let output = Command::new("tsh")
-            .args(["beams", "scp", &local_path.to_string_lossy(), &dest])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("failed to run tsh beams scp (push)")?;
+        let mut last_err = None;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("scp push failed for {}: {stderr}", local_path.display());
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = INITIAL_BACKOFF * 2u32.pow(attempt - 1);
+                warn!("scp push retry {attempt}/{MAX_RETRIES} for {} (backoff {:?})", local_path.display(), backoff);
+                tokio::time::sleep(backoff).await;
+            }
+
+            let output = tsh_command()
+                .args(["beams", "scp", &local_path.to_string_lossy(), &dest])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .context("failed to run tsh beams scp (push)")?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            last_err = Some(String::from_utf8_lossy(&output.stderr).to_string());
         }
 
-        Ok(())
+        anyhow::bail!("scp push failed for {} after {MAX_RETRIES} retries: {}", local_path.display(), last_err.unwrap_or_default())
     }
 
-    /// scp a file from the beam to local
+    /// scp a file from the beam to local (with retry)
     pub async fn scp_from_beam(beam_id: &str, remote_path: &str, local_path: &Path) -> Result<()> {
         if let Some(parent) = local_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let src = format!("{beam_id}:{remote_path}");
-        let output = Command::new("tsh")
-            .args(["beams", "scp", &src, &local_path.to_string_lossy()])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("failed to run tsh beams scp (pull)")?;
+        let mut last_err = None;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("scp pull failed for {remote_path}: {stderr}");
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = INITIAL_BACKOFF * 2u32.pow(attempt - 1);
+                warn!("scp pull retry {attempt}/{MAX_RETRIES} for {remote_path} (backoff {:?})", backoff);
+                tokio::time::sleep(backoff).await;
+            }
+
+            let output = tsh_command()
+                .args(["beams", "scp", &src, &local_path.to_string_lossy()])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .context("failed to run tsh beams scp (pull)")?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            last_err = Some(String::from_utf8_lossy(&output.stderr).to_string());
         }
 
-        Ok(())
+        anyhow::bail!("scp pull failed for {remote_path} after {MAX_RETRIES} retries: {}", last_err.unwrap_or_default())
     }
 
-    /// Run a shell command string in the beam (handles redirects, pipes, etc.)
-    /// tsh beams exec already wraps in `bash -c`, so we pass the command directly.
+    /// Run a shell command string in the beam (with retry)
     pub async fn exec_shell(beam_id: &str, shell_cmd: &str) -> Result<()> {
-        let output = Command::new("tsh")
-            .args(["beams", "exec", beam_id, "--", shell_cmd])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("failed to exec shell in beam")?;
+        let mut last_err = None;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("shell exec failed: {stderr}");
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = INITIAL_BACKOFF * 2u32.pow(attempt - 1);
+                warn!("exec_shell retry {attempt}/{MAX_RETRIES} (backoff {:?})", backoff);
+                tokio::time::sleep(backoff).await;
+            }
+
+            let output = tsh_command()
+                .args(["beams", "exec", beam_id, "--", shell_cmd])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .context("failed to exec shell in beam")?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            last_err = Some(String::from_utf8_lossy(&output.stderr).to_string());
         }
 
-        Ok(())
+        anyhow::bail!("shell exec failed after {MAX_RETRIES} retries: {}", last_err.unwrap_or_default())
     }
 
-    /// Run a non-interactive command in the beam (no output captured)
+    /// Run a non-interactive command in the beam (with retry)
     pub async fn exec_cmd(beam_id: &str, cmd: &[&str]) -> Result<()> {
         let mut args = vec!["beams", "exec", beam_id, "--"];
         args.extend(cmd);
+        let mut last_err = None;
 
-        let output = Command::new("tsh")
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .context("failed to exec in beam")?;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = INITIAL_BACKOFF * 2u32.pow(attempt - 1);
+                warn!("exec_cmd retry {attempt}/{MAX_RETRIES} (backoff {:?})", backoff);
+                tokio::time::sleep(backoff).await;
+            }
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("exec failed ({}): {stderr}", cmd.join(" "));
+            let output = tsh_command()
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .context("failed to exec in beam")?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            last_err = Some(String::from_utf8_lossy(&output.stderr).to_string());
         }
 
-        Ok(())
+        anyhow::bail!("exec failed ({}) after {MAX_RETRIES} retries: {}", cmd.join(" "), last_err.unwrap_or_default())
     }
 
     /// Run a non-interactive command and capture stdout
@@ -282,7 +362,7 @@ impl Beam {
         let mut args = vec!["beams", "exec", beam_id, "--"];
         args.extend(cmd);
 
-        let output = Command::new("tsh")
+        let output = tsh_command()
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

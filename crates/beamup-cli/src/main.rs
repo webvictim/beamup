@@ -7,6 +7,8 @@ mod transfer;
 mod transport;
 mod watcher;
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -25,6 +27,14 @@ struct Cli {
 
     #[arg(short, long, global = true)]
     quiet: bool,
+
+    /// Path to a Teleport identity file (from tbot/Machine ID)
+    #[arg(short, long, global = true)]
+    identity: Option<PathBuf>,
+
+    /// Teleport proxy address (required when using --identity)
+    #[arg(long, global = true)]
+    proxy: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -44,6 +54,8 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    beam::set_identity_file(cli.identity, cli.proxy);
 
     let filter = if cli.verbose {
         "beamup=debug,beamup_protocol=debug"

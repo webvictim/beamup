@@ -171,7 +171,16 @@ impl TransferPool {
                 let batch_bytes = batch.total_bytes;
                 info!("tar push batch {batch_idx}: {} files, {} bytes", batch_paths.len(), batch_bytes);
 
-                let result = tar_push_batch(&beam_id, &local_dir, &remote_dir, &batch.paths).await;
+                let mut result = tar_push_batch(&beam_id, &local_dir, &remote_dir, &batch.paths).await;
+                for retry in 1..=3u32 {
+                    if result.is_ok() {
+                        break;
+                    }
+                    let backoff = std::time::Duration::from_secs(1) * 2u32.pow(retry - 1);
+                    warn!("tar push batch {batch_idx} retry {retry}/3 (backoff {backoff:?})");
+                    tokio::time::sleep(backoff).await;
+                    result = tar_push_batch(&beam_id, &local_dir, &remote_dir, &batch.paths).await;
+                }
                 let duration = start.elapsed();
 
                 match result {
@@ -239,7 +248,16 @@ impl TransferPool {
                 let batch_bytes = batch.total_bytes;
                 debug!("tar pull batch {batch_idx}: {} files, {} bytes", batch_paths.len(), batch_bytes);
 
-                let result = tar_pull_batch(&beam_id, &local_dir, &remote_dir, &batch.paths).await;
+                let mut result = tar_pull_batch(&beam_id, &local_dir, &remote_dir, &batch.paths).await;
+                for retry in 1..=3u32 {
+                    if result.is_ok() {
+                        break;
+                    }
+                    let backoff = std::time::Duration::from_secs(1) * 2u32.pow(retry - 1);
+                    warn!("tar pull batch {batch_idx} retry {retry}/3 (backoff {backoff:?})");
+                    tokio::time::sleep(backoff).await;
+                    result = tar_pull_batch(&beam_id, &local_dir, &remote_dir, &batch.paths).await;
+                }
                 let duration = start.elapsed();
 
                 match result {
@@ -323,7 +341,7 @@ async fn tar_push_batch(
     remote_dir: &str,
     paths: &[String],
 ) -> Result<u64> {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     let beam_id = beam_id.to_string();
     let remote_dir = remote_dir.to_string();
@@ -331,7 +349,7 @@ async fn tar_push_batch(
     let paths = paths.to_vec();
 
     tokio::task::spawn_blocking(move || -> Result<u64> {
-        let mut child = Command::new("tsh")
+        let mut child = crate::beam::tsh_command_sync()
             .args(["beams", "exec", &beam_id, "--", "tar", "xf", "-", "-C", &remote_dir])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -390,7 +408,7 @@ async fn tar_pull_batch(
     paths: &[String],
 ) -> Result<u64> {
     use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     let beam_id = beam_id.to_string();
     let remote_dir = remote_dir.to_string();
@@ -399,7 +417,7 @@ async fn tar_pull_batch(
 
     tokio::task::spawn_blocking(move || -> Result<u64> {
         // Use -T - to pass file list via stdin (avoids arg length limits)
-        let mut child = Command::new("tsh")
+        let mut child = crate::beam::tsh_command_sync()
             .args(["beams", "exec", &beam_id, "--", "tar", "cf", "-", "-C", &remote_dir, "-T", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

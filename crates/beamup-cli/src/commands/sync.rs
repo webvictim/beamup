@@ -36,8 +36,12 @@ pub struct SyncArgs {
     pub initial_sync: CliSyncDirection,
 
     /// Direction for ongoing sync
-    #[arg(long, value_enum, default_value = "bidirectional")]
+    #[arg(long, value_enum, default_value = "bidirectional", conflicts_with = "oneshot")]
     pub ongoing_sync: CliSyncDirection,
+
+    /// Exit after initial sync, printing the beam name to stdout
+    #[arg(long)]
+    pub oneshot: bool,
 }
 
 pub async fn run(args: SyncArgs) -> Result<()> {
@@ -77,7 +81,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
 
     let chunk_size_bytes = args.chunk_size * 1024 * 1024;
     let mut engine = SyncEngine::new(
-        beam_id,
+        beam_id.clone(),
         local_dir,
         args.remote_path,
         args.concurrency,
@@ -86,5 +90,12 @@ pub async fn run(args: SyncArgs) -> Result<()> {
         args.ongoing_sync.into(),
     )
     .await?;
+
+    if args.oneshot {
+        engine.run_initial_sync_only().await?;
+        println!("{beam_id}");
+        return Ok(());
+    }
+
     engine.run(None).await
 }

@@ -13,16 +13,16 @@ use crate::syncer::SyncEngine;
 #[derive(Args)]
 pub struct StartArgs {
     /// Local directory to sync (default: current directory)
-    #[arg(short, long)]
-    pub path: Option<PathBuf>,
+    #[arg(long)]
+    pub local_path: Option<PathBuf>,
 
     /// Use an existing beam instead of creating one
     #[arg(short, long)]
     pub beam: Option<String>,
 
     /// Remote directory to sync into
-    #[arg(short, long, default_value = "/home/beams/sync")]
-    pub remote_dir: String,
+    #[arg(long, default_value = "/home/beams/sync")]
+    pub remote_path: String,
 
     /// Skip initial sync
     #[arg(long)]
@@ -55,7 +55,7 @@ pub struct StartArgs {
 
 pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
     let local_dir = args
-        .path
+        .local_path
         .unwrap_or_else(|| std::env::current_dir().expect("cannot get current directory"));
     let local_dir = local_dir.canonicalize()?;
 
@@ -82,7 +82,7 @@ pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
     let session = Session {
         beam_id: beam_id.clone(),
         local_dir: local_dir.clone(),
-        remote_dir: args.remote_dir.clone(),
+        remote_dir: args.remote_path.clone(),
     };
     session.save()?;
 
@@ -91,12 +91,12 @@ pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
 
     let chunk_size_bytes = args.chunk_size * 1024 * 1024;
 
-    info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
+    info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_path);
 
     let mut engine = SyncEngine::new(
         beam_id.clone(),
         local_dir,
-        args.remote_dir,
+        args.remote_path,
         args.concurrency,
         chunk_size_bytes,
         args.initial_sync.into(),

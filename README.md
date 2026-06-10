@@ -27,6 +27,14 @@ Requires [cross](https://github.com/cross-rs/cross) for the agent cross-compilat
 cargo build
 ```
 
+To cross-compile only the agent binary (without building the CLI):
+
+```bash
+cross build --release --target aarch64-unknown-linux-musl -p beamup-agent
+```
+
+This produces `target/aarch64-unknown-linux-musl/release/beamup-agent`. Subsequent `cargo build` of the CLI will automatically embed it.
+
 ## Usage
 
 ```bash

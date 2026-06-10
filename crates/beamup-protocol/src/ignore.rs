@@ -30,7 +30,7 @@ impl IgnoreRules {
             }
         }
 
-        // Always ignore beamup internals
+        // Always ignore beamup internals and platform-specific git files
         let mut builder = GitignoreBuilder::new(root);
         let _ = builder.add_line(None, "*.beamup-tmp");
         let _ = builder.add_line(None, "*.beamup-pull-tmp");
@@ -38,6 +38,10 @@ impl IgnoreRules {
         let _ = builder.add_line(None, "*.beamup-lz4");
         let _ = builder.add_line(None, "*.beamup-lz4-chunk-*");
         let _ = builder.add_line(None, "*.beamup-chunk-tmp");
+        let _ = builder.add_line(None, ".git/index");
+        let _ = builder.add_line(None, ".git/index.lock");
+        let _ = builder.add_line(None, ".git/modules/**/index");
+        let _ = builder.add_line(None, ".git/modules/**/index.lock");
         if let Ok(gi) = builder.build() {
             rules.push(gi);
         }
@@ -185,6 +189,26 @@ mod tests {
 
         let full_path = root.join("src/main.rs");
         assert!(!rules.filter_path(&root, &full_path, false));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ignores_git_index_files() {
+        let root = setup_test_dir("ignore-git-index");
+        let rules = IgnoreRules::load(&root);
+
+        assert!(rules.is_ignored(Path::new(".git/index"), false));
+        assert!(rules.is_ignored(Path::new(".git/index.lock"), false));
+        assert!(rules.is_ignored(Path::new(".git/modules/e/index"), false));
+        assert!(rules.is_ignored(Path::new(".git/modules/e/index.lock"), false));
+        assert!(rules.is_ignored(Path::new(".git/modules/deep/nested/index"), false));
+        assert!(rules.is_ignored(Path::new(".git/modules/deep/nested/index.lock"), false));
+
+        // Shouldn't block other .git files
+        assert!(!rules.is_ignored(Path::new(".git/HEAD"), false));
+        assert!(!rules.is_ignored(Path::new(".git/config"), false));
+        assert!(!rules.is_ignored(Path::new(".git/refs/heads/main"), false));
 
         let _ = fs::remove_dir_all(&root);
     }

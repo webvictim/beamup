@@ -5,11 +5,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use beamup_protocol::hash::hash_file;
 use beamup_protocol::ignore::{relative_path, IgnoreRules};
-use beamup_protocol::messages::{ManifestEntry, Message, INLINE_THRESHOLD, PROTOCOL_VERSION};
+use beamup_protocol::messages::{ManifestEntry, Message, SyncDirection, INLINE_THRESHOLD, PROTOCOL_VERSION};
+use indicatif::{ProgressBar, ProgressStyle};
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::beam::Beam;
+use crate::progress;
 use crate::transfer::TransferPool;
 use crate::transport::Transport;
 use crate::watcher::{FsWatcher, WatchEvent};
@@ -37,6 +40,8 @@ pub struct SyncEngine {
     suppress_set: HashMap<String, Instant>,
     in_flight: HashSet<String>,
     chunk_size: usize,
+    initial_direction: SyncDirection,
+    ongoing_direction: SyncDirection,
 }
 
 impl SyncEngine {
@@ -46,6 +51,8 @@ impl SyncEngine {
         remote_dir: String,
         concurrency: usize,
         chunk_size: usize,
+        initial_direction: SyncDirection,
+        ongoing_direction: SyncDirection,
     ) -> Result<Self> {
         let mut child = Beam::spawn_agent(&beam_id, &remote_dir)?;
 
@@ -73,16 +80,20 @@ impl SyncEngine {
             suppress_set: HashMap::new(),
             in_flight: HashSet::new(),
             chunk_size,
+            initial_direction,
+            ongoing_direction,
         })
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self, on_sync_complete: Option<oneshot::Sender<()>>) -> Result<()> {
         // Handshake
         let session_id = uuid_simple();
         self.transport
             .send(Message::Hello {
                 version: PROTOCOL_VERSION,
                 session_id: session_id.clone(),
+                initial_direction: self.initial_direction,
+                ongoing_direction: self.ongoing_direction,
             })
             .await?;
 
@@ -114,8 +125,20 @@ impl SyncEngine {
             bw
         );
 
-        // Start local watcher
-        let mut watcher = FsWatcher::new(&self.local_dir, &self.ignore_rules)?;
+        if on_sync_complete.is_none() {
+            eprintln!("Connect with: tsh beams console {}", self.beam_id);
+        }
+
+        if let Some(tx) = on_sync_complete {
+            let _ = tx.send(());
+        }
+
+        // Start local watcher (only if ongoing sync pushes local changes)
+        let mut watcher = if self.ongoing_direction.should_push() {
+            Some(FsWatcher::new(&self.local_dir, &self.ignore_rules)?)
+        } else {
+            None
+        };
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         let mut last_pong = Instant::now();
 
@@ -140,7 +163,12 @@ impl SyncEngine {
                         }
                     }
                 }
-                event = watcher.rx.recv() => {
+                event = async {
+                    match watcher.as_mut() {
+                        Some(w) => w.rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     if let Some(event) = event {
                         self.handle_local_event(event).await?;
                     }
@@ -194,8 +222,40 @@ impl SyncEngine {
         let pull_count = to_pull.len();
         info!("sync plan: push {push_count} files, pull {pull_count} files");
 
+        // Set up progress bar (only counting bytes for the active direction)
+        let total_push_bytes: u64 = if self.initial_direction.should_push() {
+            to_push.iter().map(|e| e.size).sum()
+        } else {
+            0
+        };
+        let total_pull_bytes: u64 = if self.initial_direction.should_pull() {
+            to_pull.iter().map(|e| e.size).sum()
+        } else {
+            0
+        };
+        let total_bytes_expected = total_push_bytes + total_pull_bytes;
+        let total_files = if self.initial_direction.should_push() { push_count } else { 0 }
+            + if self.initial_direction.should_pull() { pull_count } else { 0 };
+        let mut files_done: usize = 0;
+
+        let pb = if total_bytes_expected > 0 {
+            let pb = ProgressBar::new(total_bytes_expected);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{bar:30.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg} [{eta}]")
+                    .unwrap()
+                    .progress_chars("=>-"),
+            );
+            pb.set_message(format!("0/{total_files} files"));
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            progress::set_progress_bar(pb.clone());
+            Some(pb)
+        } else {
+            None
+        };
+
         // Push files: tar batch for all files <= chunk_size, chunked scp for huge files
-        if !to_push.is_empty() {
+        if !to_push.is_empty() && self.initial_direction.should_push() {
             let mut tar_files = Vec::new();
             let mut huge = Vec::new();
             for entry in &to_push {
@@ -211,12 +271,17 @@ impl SyncEngine {
                 let paths: Vec<String> = tar_files.iter().map(|e| e.path.clone()).collect();
                 let sizes: Vec<u64> = tar_files.iter().map(|e| e.size).collect();
                 let tar_total: u64 = sizes.iter().sum();
-                info!("pushing {} files via tar ({})", paths.len(), format_size(tar_total));
                 let results = self.transfer_pool.push_batch_tar(paths, sizes).await;
                 total_bytes += tar_total;
                 let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
                 if !failures.is_empty() {
                     warn!("{} tar push failures", failures.len());
+                }
+
+                files_done += tar_files.len();
+                if let Some(ref pb) = pb {
+                    pb.inc(tar_total);
+                    pb.set_message(format!("{files_done}/{total_files} files"));
                 }
 
                 for entry in &tar_files {
@@ -228,33 +293,43 @@ impl SyncEngine {
                         })
                         .await?;
                 }
-                info!("sent {} FileReady notifications", tar_files.len());
             }
 
             // Push huge files via chunked scp
             if !huge.is_empty() {
-                let huge_total: u64 = huge.iter().map(|e| e.size).sum();
-                info!(
-                    "pushing {} large files via chunked scp ({})",
-                    huge.len(),
-                    format_size(huge_total)
-                );
-                for entry in &huge {
-                    info!("  chunked: {} ({})", entry.path, format_size(entry.size));
-                }
+                let num_huge = huge.len();
                 let paths: Vec<String> = huge.iter().map(|e| e.path.clone()).collect();
-                let results = self.transfer_pool.push_batch(paths).await;
-                for r in &results {
-                    if r.success {
-                        total_bytes += r.bytes;
+                for path in paths {
+                    self.transfer_pool.push(path);
+                }
+                let mut remaining = num_huge;
+                while remaining > 0 {
+                    tokio::select! {
+                        Some(result) = self.transfer_pool.results_rx.recv() => {
+                            remaining -= 1;
+                            if result.success {
+                                files_done += 1;
+                                if let Some(ref pb) = pb {
+                                    pb.set_message(format!("{files_done}/{total_files} files"));
+                                }
+                            } else {
+                                warn!("push failed: {} — {:?}", result.path, result.error);
+                            }
+                        }
+                        Some(bytes) = self.transfer_pool.progress_rx.recv() => {
+                            total_bytes += bytes;
+                            if let Some(ref pb) = pb {
+                                pb.inc(bytes);
+                            }
+                        }
                     }
                 }
-                let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
-                if !failures.is_empty() {
-                    for f in &failures {
-                        warn!("push failed: {} — {:?}", f.path, f.error);
+                // Drain any remaining progress messages
+                while let Ok(bytes) = self.transfer_pool.progress_rx.try_recv() {
+                    total_bytes += bytes;
+                    if let Some(ref pb) = pb {
+                        pb.inc(bytes);
                     }
-                    warn!("{} push failures", failures.len());
                 }
 
                 for entry in &huge {
@@ -270,7 +345,7 @@ impl SyncEngine {
         }
 
         // Pull files: tar batch for all files <= chunk_size, chunked scp for huge files
-        if !to_pull.is_empty() {
+        if !to_pull.is_empty() && self.initial_direction.should_pull() {
             let mut tar_files = Vec::new();
             let mut huge_pull = Vec::new();
             for entry in &to_pull {
@@ -286,30 +361,55 @@ impl SyncEngine {
                 let paths: Vec<String> = tar_files.iter().map(|e| e.path.clone()).collect();
                 let sizes: Vec<u64> = tar_files.iter().map(|e| e.size).collect();
                 let pull_total: u64 = sizes.iter().sum();
-                info!("pulling {} files via tar ({})", paths.len(), format_size(pull_total));
                 let results = self.transfer_pool.pull_batch_tar(paths, sizes).await;
                 total_bytes += pull_total;
                 let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
                 if !failures.is_empty() {
                     warn!("{} tar pull failures", failures.len());
                 }
+
+                files_done += tar_files.len();
+                if let Some(ref pb) = pb {
+                    pb.inc(pull_total);
+                    pb.set_message(format!("{files_done}/{total_files} files"));
+                }
             }
 
             // Pull huge files via chunked scp
             if !huge_pull.is_empty() {
+                let num_huge = huge_pull.len();
                 let paths: Vec<String> = huge_pull.iter().map(|e| e.path.clone()).collect();
-                let results = self.transfer_pool.pull_batch(paths).await;
-                for r in &results {
-                    if r.success {
-                        total_bytes += r.bytes;
+                for path in paths {
+                    self.transfer_pool.pull(path);
+                }
+                let mut remaining = num_huge;
+                while remaining > 0 {
+                    tokio::select! {
+                        Some(result) = self.transfer_pool.results_rx.recv() => {
+                            remaining -= 1;
+                            if result.success {
+                                files_done += 1;
+                                if let Some(ref pb) = pb {
+                                    pb.set_message(format!("{files_done}/{total_files} files"));
+                                }
+                            } else {
+                                warn!("pull failed: {} — {:?}", result.path, result.error);
+                            }
+                        }
+                        Some(bytes) = self.transfer_pool.progress_rx.recv() => {
+                            total_bytes += bytes;
+                            if let Some(ref pb) = pb {
+                                pb.inc(bytes);
+                            }
+                        }
                     }
                 }
-                let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
-                if !failures.is_empty() {
-                    for f in &failures {
-                        warn!("pull failed: {} — {:?}", f.path, f.error);
+                // Drain any remaining progress messages
+                while let Ok(bytes) = self.transfer_pool.progress_rx.try_recv() {
+                    total_bytes += bytes;
+                    if let Some(ref pb) = pb {
+                        pb.inc(bytes);
                     }
-                    warn!("{} pull failures", failures.len());
                 }
             }
 
@@ -348,6 +448,11 @@ impl SyncEngine {
             }
         }
 
+        if let Some(pb) = pb {
+            pb.finish_and_clear();
+            progress::clear_progress_bar();
+        }
+
         // Exchange ManifestAck
         info!("sending ManifestAck, waiting for agent...");
         self.transport.send(Message::ManifestAck).await?;
@@ -374,10 +479,17 @@ impl SyncEngine {
     }
 
     async fn handle_remote_message(&mut self, msg: Message) -> Result<()> {
-        match msg {
+        match &msg {
             Message::Ping => {
                 self.transport.send(Message::Pong).await?;
+                return Ok(());
             }
+            _ if !self.ongoing_direction.should_pull() => {
+                return Ok(());
+            }
+            _ => {}
+        }
+        match msg {
             Message::FileContent { path, hash, data } => {
                 self.write_local_file_inline(&path, &data, hash)?;
             }
@@ -437,6 +549,9 @@ impl SyncEngine {
     }
 
     async fn handle_local_event(&mut self, event: WatchEvent) -> Result<()> {
+        if !self.ongoing_direction.should_push() {
+            return Ok(());
+        }
         match event {
             WatchEvent::Modified(path) => {
                 let rel = relative_path(&self.local_dir, &path);

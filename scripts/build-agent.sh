@@ -13,3 +13,9 @@ fi
 
 SIZE=$(du -h "$BINARY" | cut -f1)
 echo "Agent binary: $BINARY ($SIZE)"
+
+# Pre-compress for faster deployment
+#echo "Compressing agent binary..."
+#gzip -9 -k -f "$BINARY"
+#GZ_SIZE=$(du -h "${BINARY}.gz" | cut -f1)
+#echo "Compressed: ${BINARY}.gz ($GZ_SIZE)"

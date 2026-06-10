@@ -56,7 +56,7 @@ impl Encoder<Message> for MessageCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messages::{ManifestEntry, SyncEntry};
+    use crate::messages::{ManifestEntry, SyncDirection, SyncEntry};
 
     fn round_trip(msg: Message) -> Message {
         let mut codec = MessageCodec;
@@ -80,13 +80,17 @@ mod tests {
     #[test]
     fn round_trip_hello() {
         let msg = Message::Hello {
-            version: 2,
+            version: 3,
             session_id: "abc123".to_string(),
+            initial_direction: SyncDirection::LocalToBeam,
+            ongoing_direction: SyncDirection::BeamToLocal,
         };
         match round_trip(msg) {
-            Message::Hello { version, session_id } => {
-                assert_eq!(version, 2);
+            Message::Hello { version, session_id, initial_direction, ongoing_direction } => {
+                assert_eq!(version, 3);
                 assert_eq!(session_id, "abc123");
+                assert_eq!(initial_direction, SyncDirection::LocalToBeam);
+                assert_eq!(ongoing_direction, SyncDirection::BeamToLocal);
             }
             other => panic!("unexpected: {other:?}"),
         }

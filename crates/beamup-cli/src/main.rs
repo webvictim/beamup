@@ -1,6 +1,7 @@
 mod beam;
 mod commands;
 mod config;
+mod progress;
 mod syncer;
 mod transfer;
 mod transport;
@@ -9,6 +10,8 @@ mod watcher;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+
+use crate::progress::ProgressMakeWriter;
 
 #[derive(Parser)]
 #[command(name = "beamup", about = "Bidirectional real-time file sync with Teleport Beams")]
@@ -50,13 +53,31 @@ async fn main() -> Result<()> {
         "beamup=info"
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(filter))
-        .with_writer(std::io::stderr)
-        .init();
+    let log_file_path = match &cli.command {
+        Commands::Start(args) if args.console => {
+            let path = std::env::temp_dir()
+                .join(format!("beamup-sync-{}.log", std::process::id()));
+            Some(path)
+        }
+        _ => None,
+    };
+
+    if let Some(ref path) = log_file_path {
+        let file = std::fs::File::create(path)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(filter))
+            .with_writer(file)
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(filter))
+            .with_writer(ProgressMakeWriter)
+            .init();
+    }
 
     match cli.command {
-        Commands::Start(args) => commands::start::run(args).await,
+        Commands::Start(args) => commands::start::run(args, log_file_path).await,
         Commands::Down(args) => commands::down::run(args).await,
         Commands::Sync(args) => commands::sync::run(args).await,
         Commands::Status(args) => commands::status::run(args).await,

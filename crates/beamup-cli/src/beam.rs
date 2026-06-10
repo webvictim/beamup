@@ -15,15 +15,7 @@ fn agent_binary_path() -> Result<PathBuf> {
         }
     }
 
-    // Check next to our own binary
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.parent().unwrap_or(exe.as_ref()).join("beamup-agent");
-        if sibling.exists() {
-            return Ok(sibling);
-        }
-    }
-
-    // Check workspace target directory (development)
+    // Check workspace target directory (development) — prefer cross-compiled Linux binary
     let candidates = [
         "target/aarch64-unknown-linux-musl/release/beamup-agent",
         "target/aarch64-unknown-linux-musl/debug/beamup-agent",
@@ -32,6 +24,14 @@ fn agent_binary_path() -> Result<PathBuf> {
         let p = PathBuf::from(candidate);
         if p.exists() {
             return Ok(p);
+        }
+    }
+
+    // Check next to our own binary (for installed/packaged deployments)
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.parent().unwrap_or(exe.as_ref()).join("beamup-agent");
+        if sibling.exists() {
+            return Ok(sibling);
         }
     }
 
@@ -147,6 +147,19 @@ impl Beam {
             .status()
             .await
             .context("failed to exec in beam")?;
+
+        Ok(status)
+    }
+
+    pub async fn console(beam_id: &str) -> Result<ExitStatus> {
+        let status = Command::new("tsh")
+            .args(["beams", "console", beam_id])
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+            .context("failed to open console on beam")?;
 
         Ok(status)
     }

@@ -5,6 +5,7 @@ use clap::Args;
 use tracing::info;
 
 use crate::beam::Beam;
+use crate::commands::CliSyncDirection;
 use crate::config::Session;
 use crate::syncer::SyncEngine;
 
@@ -29,6 +30,14 @@ pub struct SyncArgs {
     /// Chunk size in MB for large file transfers (default: 64)
     #[arg(long, default_value = "64")]
     pub chunk_size: usize,
+
+    /// Direction for initial sync
+    #[arg(long, value_enum, default_value = "bidirectional")]
+    pub initial_sync: CliSyncDirection,
+
+    /// Direction for ongoing sync
+    #[arg(long, value_enum, default_value = "bidirectional")]
+    pub ongoing_sync: CliSyncDirection,
 }
 
 pub async fn run(args: SyncArgs) -> Result<()> {
@@ -67,7 +76,15 @@ pub async fn run(args: SyncArgs) -> Result<()> {
     info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
 
     let chunk_size_bytes = args.chunk_size * 1024 * 1024;
-    let mut engine =
-        SyncEngine::new(beam_id, local_dir, args.remote_dir, args.concurrency, chunk_size_bytes).await?;
-    engine.run().await
+    let mut engine = SyncEngine::new(
+        beam_id,
+        local_dir,
+        args.remote_dir,
+        args.concurrency,
+        chunk_size_bytes,
+        args.initial_sync.into(),
+        args.ongoing_sync.into(),
+    )
+    .await?;
+    engine.run(None).await
 }

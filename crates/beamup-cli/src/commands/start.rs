@@ -2,9 +2,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
+use tokio::sync::oneshot;
 use tracing::info;
 
 use crate::beam::Beam;
+use crate::commands::CliSyncDirection;
 use crate::config::Session;
 use crate::syncer::SyncEngine;
 
@@ -37,9 +39,21 @@ pub struct StartArgs {
     /// Chunk size in MB for large file transfers (default: 64)
     #[arg(long, default_value = "64")]
     pub chunk_size: usize,
+
+    /// Drop into a console on the beam after initial sync
+    #[arg(long)]
+    pub console: bool,
+
+    /// Direction for initial sync
+    #[arg(long, value_enum, default_value = "bidirectional")]
+    pub initial_sync: CliSyncDirection,
+
+    /// Direction for ongoing sync
+    #[arg(long, value_enum, default_value = "bidirectional")]
+    pub ongoing_sync: CliSyncDirection,
 }
 
-pub async fn run(args: StartArgs) -> Result<()> {
+pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
     let local_dir = args
         .path
         .unwrap_or_else(|| std::env::current_dir().expect("cannot get current directory"));
@@ -79,7 +93,36 @@ pub async fn run(args: StartArgs) -> Result<()> {
 
     info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_dir);
 
-    let mut engine =
-        SyncEngine::new(beam_id, local_dir, args.remote_dir, args.concurrency, chunk_size_bytes).await?;
-    engine.run().await
+    let mut engine = SyncEngine::new(
+        beam_id.clone(),
+        local_dir,
+        args.remote_dir,
+        args.concurrency,
+        chunk_size_bytes,
+        args.initial_sync.into(),
+        args.ongoing_sync.into(),
+    )
+    .await?;
+
+    if !args.console {
+        return engine.run(None).await;
+    }
+
+    // Console mode: run sync in background, launch console after initial sync completes
+    let (sync_done_tx, sync_done_rx) = oneshot::channel::<()>();
+
+    let sync_handle = tokio::spawn(async move {
+        engine.run(Some(sync_done_tx)).await
+    });
+
+    let _ = sync_done_rx.await;
+
+    if let Some(ref path) = log_file {
+        eprintln!("Sync running in background. Logs: {}", path.display());
+    }
+
+    let status = Beam::console(&beam_id).await?;
+
+    sync_handle.abort();
+    std::process::exit(status.code().unwrap_or(0));
 }

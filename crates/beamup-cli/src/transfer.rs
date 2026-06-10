@@ -35,6 +35,8 @@ pub struct TransferPool {
     chunk_size: usize,
     results_tx: mpsc::Sender<TransferResult>,
     pub results_rx: mpsc::Receiver<TransferResult>,
+    progress_tx: mpsc::Sender<u64>,
+    pub progress_rx: mpsc::Receiver<u64>,
 }
 
 impl TransferPool {
@@ -46,6 +48,7 @@ impl TransferPool {
         chunk_size: usize,
     ) -> Self {
         let (results_tx, results_rx) = mpsc::channel(256);
+        let (progress_tx, progress_rx) = mpsc::channel(1024);
         Self {
             beam_id,
             remote_dir,
@@ -54,12 +57,15 @@ impl TransferPool {
             chunk_size,
             results_tx,
             results_rx,
+            progress_tx,
+            progress_rx,
         }
     }
 
     pub fn push(&self, relative_path: String) -> JoinHandle<()> {
         let sem = self.semaphore.clone();
         let tx = self.results_tx.clone();
+        let progress_tx = self.progress_tx.clone();
         let beam_id = self.beam_id.clone();
         let local_path = self.local_dir.join(&relative_path);
         let remote_path = format!("{}/{}", self.remote_dir, relative_path);
@@ -69,7 +75,7 @@ impl TransferPool {
             let start = Instant::now();
             let size = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
             debug!("push start: {} ({size} bytes)", relative_path);
-            let result = push_file(&beam_id, &local_path, &remote_path, &sem, chunk_size).await;
+            let result = push_file(&beam_id, &local_path, &remote_path, &sem, chunk_size, &progress_tx).await;
             let duration = start.elapsed();
 
             if result.is_ok() {
@@ -103,6 +109,7 @@ impl TransferPool {
     pub fn pull(&self, relative_path: String) -> JoinHandle<()> {
         let sem = self.semaphore.clone();
         let tx = self.results_tx.clone();
+        let progress_tx = self.progress_tx.clone();
         let beam_id = self.beam_id.clone();
         let local_path = self.local_dir.join(&relative_path);
         let remote_path = format!("{}/{}", self.remote_dir, relative_path);
@@ -111,7 +118,7 @@ impl TransferPool {
         tokio::spawn(async move {
             let start = Instant::now();
             debug!("pull start: {}", relative_path);
-            let result = pull_file(&beam_id, &remote_path, &local_path, &sem, chunk_size).await;
+            let result = pull_file(&beam_id, &remote_path, &local_path, &sem, chunk_size, &progress_tx).await;
             let duration = start.elapsed();
             let size = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
 
@@ -141,30 +148,6 @@ impl TransferPool {
                 })
                 .await;
         })
-    }
-
-    pub async fn push_batch(&mut self, paths: Vec<String>) -> Vec<TransferResult> {
-        let handles: Vec<_> = paths.into_iter().map(|p| self.push(p)).collect();
-        for handle in handles {
-            let _ = handle.await;
-        }
-        let mut results = Vec::new();
-        while let Ok(result) = self.results_rx.try_recv() {
-            results.push(result);
-        }
-        results
-    }
-
-    pub async fn pull_batch(&mut self, paths: Vec<String>) -> Vec<TransferResult> {
-        let handles: Vec<_> = paths.into_iter().map(|p| self.pull(p)).collect();
-        for handle in handles {
-            let _ = handle.await;
-        }
-        let mut results = Vec::new();
-        while let Ok(result) = self.results_rx.try_recv() {
-            results.push(result);
-        }
-        results
     }
 
     /// Push files via tar streaming through tsh beams exec pipes.
@@ -461,6 +444,7 @@ async fn push_file(
     remote_path: &str,
     sem: &Arc<Semaphore>,
     chunk_size: usize,
+    progress_tx: &mpsc::Sender<u64>,
 ) -> Result<()> {
     let metadata = std::fs::metadata(local_path)?;
     let size = metadata.len();
@@ -468,6 +452,7 @@ async fn push_file(
     if size <= chunk_size as u64 {
         let _permit = sem.acquire().await.unwrap();
         Beam::scp_to_beam(beam_id, local_path, remote_path).await?;
+        let _ = progress_tx.send(size).await;
         debug!("pushed (single): {} ({size} bytes)", local_path.display());
     } else {
         use std::io::Read;
@@ -483,6 +468,7 @@ async fn push_file(
         let mut file = std::fs::File::open(local_path)?;
         let mut buf = vec![0u8; chunk_size];
         let mut chunk_idx = 0;
+        let mut chunk_sizes: Vec<u64> = Vec::new();
 
         loop {
             let bytes_read = file.read(&mut buf)?;
@@ -492,6 +478,7 @@ async fn push_file(
             let compressed = compress::compress(&buf[..bytes_read]);
             let chunk_local = local_tmp.join(format!("chunk-{chunk_idx:04}"));
             std::fs::write(&chunk_local, &compressed)?;
+            chunk_sizes.push(bytes_read as u64);
             chunk_idx += 1;
         }
         let num_chunks = chunk_idx;
@@ -507,11 +494,16 @@ async fn push_file(
             let chunk_remote = format!("{remote_tmp}/chunk-{i:04}");
             let beam_id = beam_id.to_string();
             let sem = sem.clone();
+            let progress_tx = progress_tx.clone();
+            let chunk_bytes = chunk_sizes[i];
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 let result = Beam::scp_to_beam(&beam_id, &chunk_local, &chunk_remote).await;
                 let _ = std::fs::remove_file(&chunk_local);
+                if result.is_ok() {
+                    let _ = progress_tx.send(chunk_bytes).await;
+                }
                 result
             }));
         }
@@ -545,6 +537,7 @@ async fn pull_file(
     local_path: &Path,
     sem: &Arc<Semaphore>,
     chunk_size: usize,
+    progress_tx: &mpsc::Sender<u64>,
 ) -> Result<()> {
     if let Some(parent) = local_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -566,7 +559,9 @@ async fn pull_file(
         let tmp_path = local_path.with_extension("beamup-pull-tmp");
         let _permit = sem.acquire().await.unwrap();
         Beam::scp_from_beam(beam_id, remote_path, &tmp_path).await?;
+        let size = std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
         std::fs::rename(&tmp_path, local_path)?;
+        let _ = progress_tx.send(size).await;
         debug!("pulled (single): {remote_path}");
         return Ok(());
     }
@@ -583,10 +578,16 @@ async fn pull_file(
         let chunk_local = local_tmp.join(format!("chunk-{i:04}"));
         let beam_id = beam_id.to_string();
         let sem = sem.clone();
+        let progress_tx = progress_tx.clone();
+        let chunk_bytes = chunk_size as u64;
 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            Beam::scp_from_beam(&beam_id, &chunk_remote, &chunk_local).await
+            let result = Beam::scp_from_beam(&beam_id, &chunk_remote, &chunk_local).await;
+            if result.is_ok() {
+                let _ = progress_tx.send(chunk_bytes).await;
+            }
+            result
         }));
     }
 
@@ -616,42 +617,51 @@ async fn pull_file(
     Ok(())
 }
 
-/// Deploy the agent binary using compressed transfer
+/// Deploy the agent binary to the beam
 pub async fn deploy_agent_chunked(
     beam_id: &str,
     agent_path: &Path,
     _concurrency: usize,
 ) -> Result<()> {
-    use std::io::Write;
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-
-    let data = std::fs::read(agent_path)?;
-    let size = data.len();
-
     // Remove existing agent binary to avoid SFTP failures when overwriting
     let _ = Beam::exec_shell(beam_id, "rm -rf /tmp/beamup-agent /tmp/beamup-xfer && mkdir -p /tmp/beamup-xfer").await;
 
-    // Gzip compress the agent binary
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(&data)?;
-    let compressed = encoder.finish()?;
-    let compressed_size = compressed.len();
-    let ratio = size as f64 / compressed_size as f64;
-    info!("deploying agent: {size} bytes -> {compressed_size} bytes compressed ({ratio:.1}x)");
+    let size = agent_path.metadata()?.len();
 
-    // Write compressed data to a temp file and SCP it
-    let local_tmp = std::env::temp_dir().join("beamup-agent-deploy.gz");
-    std::fs::write(&local_tmp, &compressed)?;
+    if size <= 50 * 1024 * 1024 {
+        // Small enough to transfer directly without compression
+        info!("deploying agent: {} bytes", size);
+        Beam::scp_to_beam(beam_id, agent_path, "/tmp/beamup-agent").await?;
+        Beam::exec_shell(beam_id, "chmod +x /tmp/beamup-agent").await?;
+    } else {
+        // Large binary — compress before transfer
+        use std::io::Write;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
 
-    Beam::scp_to_beam(beam_id, &local_tmp, "/tmp/beamup-agent.gz").await?;
-    let _ = std::fs::remove_file(&local_tmp);
+        let gz_path = agent_path.with_extension("gz");
+        let local_tmp = std::env::temp_dir().join("beamup-agent-deploy.gz");
 
-    // Decompress on the beam with gunzip
-    Beam::exec_shell(
-        beam_id,
-        "gunzip -f /tmp/beamup-agent.gz && chmod +x /tmp/beamup-agent"
-    ).await?;
+        if gz_path.exists() {
+            let gz_size = gz_path.metadata()?.len();
+            let ratio = size as f64 / gz_size as f64;
+            info!("deploying agent (pre-compressed): {size} bytes -> {gz_size} bytes ({ratio:.1}x)");
+            std::fs::copy(&gz_path, &local_tmp)?;
+        } else {
+            let data = std::fs::read(agent_path)?;
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&data)?;
+            let compressed = encoder.finish()?;
+            let compressed_size = compressed.len();
+            let ratio = size as f64 / compressed_size as f64;
+            info!("deploying agent: {size} bytes -> {compressed_size} bytes compressed ({ratio:.1}x)");
+            std::fs::write(&local_tmp, &compressed)?;
+        }
+
+        Beam::scp_to_beam(beam_id, &local_tmp, "/tmp/beamup-agent.gz").await?;
+        let _ = std::fs::remove_file(&local_tmp);
+        Beam::exec_shell(beam_id, "gunzip -f /tmp/beamup-agent.gz && chmod +x /tmp/beamup-agent").await?;
+    }
 
     Ok(())
 }

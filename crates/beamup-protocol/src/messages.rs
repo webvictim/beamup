@@ -1,16 +1,38 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Threshold below which files are sent inline via the pipe.
 /// Above this, scp is used for transfer.
 pub const INLINE_THRESHOLD: u64 = 64 * 1024; // 64 KB
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SyncDirection {
+    LocalToBeam,
+    BeamToLocal,
+    #[default]
+    Bidirectional,
+}
+
+impl SyncDirection {
+    pub fn should_push(&self) -> bool {
+        matches!(self, SyncDirection::LocalToBeam | SyncDirection::Bidirectional)
+    }
+
+    pub fn should_pull(&self) -> bool {
+        matches!(self, SyncDirection::BeamToLocal | SyncDirection::Bidirectional)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     Hello {
         version: u32,
         session_id: String,
+        #[serde(default)]
+        initial_direction: SyncDirection,
+        #[serde(default)]
+        ongoing_direction: SyncDirection,
     },
     HelloAck {
         version: u32,
@@ -113,8 +135,19 @@ mod tests {
     #[test]
     fn all_variants_serialize() {
         let messages = vec![
-            Message::Hello { version: 2, session_id: "test".into() },
-            Message::HelloAck { version: 2 },
+            Message::Hello {
+                version: 3,
+                session_id: "test".into(),
+                initial_direction: SyncDirection::Bidirectional,
+                ongoing_direction: SyncDirection::Bidirectional,
+            },
+            Message::Hello {
+                version: 3,
+                session_id: "directed".into(),
+                initial_direction: SyncDirection::LocalToBeam,
+                ongoing_direction: SyncDirection::BeamToLocal,
+            },
+            Message::HelloAck { version: 3 },
             Message::FileManifest { entries: vec![
                 ManifestEntry { path: "a/b.rs".into(), hash: 42, mtime: 1000, size: 500, is_dir: false },
             ]},

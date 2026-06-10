@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use beamup_protocol::hash::{hash_content, hash_file};
 use beamup_protocol::ignore::IgnoreRules;
-use beamup_protocol::messages::{ManifestEntry, Message, SyncEntry, INLINE_THRESHOLD, PROTOCOL_VERSION};
+use beamup_protocol::messages::{ManifestEntry, Message, SyncDirection, SyncEntry, INLINE_THRESHOLD, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -31,8 +31,13 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
     let mut suppress_set: HashMap<String, Instant> = HashMap::new();
 
     // Wait for Hello
-    let _session_id = match transport.recv().await? {
-        Some(Message::Hello { version, session_id }) => {
+    let (initial_direction, ongoing_direction) = match transport.recv().await? {
+        Some(Message::Hello {
+            version,
+            session_id,
+            initial_direction,
+            ongoing_direction,
+        }) => {
             if version != PROTOCOL_VERSION {
                 anyhow::bail!(
                     "protocol version mismatch: got {version}, expected {PROTOCOL_VERSION}"
@@ -43,8 +48,8 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
                     version: PROTOCOL_VERSION,
                 })
                 .await?;
-            info!("handshake complete, session: {session_id}");
-            session_id
+            info!("handshake complete, session: {session_id}, initial: {initial_direction:?}, ongoing: {ongoing_direction:?}");
+            (initial_direction, ongoing_direction)
         }
         other => anyhow::bail!("expected Hello, got: {other:?}"),
     };
@@ -53,9 +58,9 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
     #[allow(unused_variables)]
     let (watch_tx, mut watch_rx) = mpsc::channel::<WatchEvent>(1024);
 
-    // Start filesystem watcher
+    // Start filesystem watcher (only if ongoing sync pulls from beam)
     #[cfg(target_os = "linux")]
-    {
+    if ongoing_direction.should_pull() {
         let dir = watch_dir.clone();
         let rules = IgnoreRules::load(&dir);
         tokio::task::spawn_blocking(move || {
@@ -77,6 +82,7 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
                             &ignore_rules,
                             &mut file_states,
                             &mut suppress_set,
+                            initial_direction,
                         ).await?;
                     }
                     None => {
@@ -87,13 +93,15 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
             }
             event = watch_rx.recv() => {
                 if let Some(event) = event {
-                    handle_watch_event(
-                        event,
-                        &transport,
-                        &watch_dir,
-                        &mut file_states,
-                        &mut suppress_set,
-                    ).await?;
+                    if ongoing_direction.should_pull() {
+                        handle_watch_event(
+                            event,
+                            &transport,
+                            &watch_dir,
+                            &mut file_states,
+                            &mut suppress_set,
+                        ).await?;
+                    }
                 }
             }
         }
@@ -111,6 +119,7 @@ async fn handle_message(
     ignore_rules: &IgnoreRules,
     file_states: &mut HashMap<String, FileState>,
     suppress_set: &mut HashMap<String, Instant>,
+    initial_direction: SyncDirection,
 ) -> Result<()> {
     match msg {
         Message::Ping => {
@@ -118,7 +127,7 @@ async fn handle_message(
         }
         Message::Pong => {}
         Message::FileManifest { entries } => {
-            handle_manifest(entries, transport, watch_dir, ignore_rules, file_states).await?;
+            handle_manifest(entries, transport, watch_dir, ignore_rules, file_states, initial_direction).await?;
         }
         Message::FileContent { path, hash, data } => {
             write_file(&path, &data, hash, watch_dir, file_states, suppress_set)?;
@@ -210,6 +219,7 @@ async fn handle_manifest(
     watch_dir: &Path,
     ignore_rules: &IgnoreRules,
     file_states: &mut HashMap<String, FileState>,
+    initial_direction: SyncDirection,
 ) -> Result<()> {
     let remote_map: HashMap<&str, &ManifestEntry> =
         remote_entries.iter().map(|e| (e.path.as_str(), e)).collect();
@@ -223,41 +233,45 @@ async fn handle_manifest(
     let mut to_pull: Vec<SyncEntry> = Vec::new(); // CLI should pull these from us
 
     // Files remote (CLI) has that we don't — CLI should push them
-    for entry in &remote_entries {
-        if entry.is_dir {
-            let dir_path = watch_dir.join(&entry.path);
-            std::fs::create_dir_all(&dir_path)?;
-            continue;
-        }
-        if !local_map.contains_key(entry.path.as_str()) {
-            to_push.push(SyncEntry {
-                path: entry.path.clone(),
-                hash: entry.hash,
-                size: entry.size,
-            });
-        } else {
-            let local = local_map[entry.path.as_str()];
-            if local.hash != entry.hash {
+    if initial_direction.should_push() {
+        for entry in &remote_entries {
+            if entry.is_dir {
+                let dir_path = watch_dir.join(&entry.path);
+                std::fs::create_dir_all(&dir_path)?;
+                continue;
+            }
+            if !local_map.contains_key(entry.path.as_str()) {
                 to_push.push(SyncEntry {
                     path: entry.path.clone(),
                     hash: entry.hash,
                     size: entry.size,
                 });
+            } else {
+                let local = local_map[entry.path.as_str()];
+                if local.hash != entry.hash {
+                    to_push.push(SyncEntry {
+                        path: entry.path.clone(),
+                        hash: entry.hash,
+                        size: entry.size,
+                    });
+                }
             }
         }
     }
 
     // Files we have that remote doesn't — CLI should pull them
-    for entry in &local_entries {
-        if entry.is_dir {
-            continue;
-        }
-        if !remote_map.contains_key(entry.path.as_str()) {
-            to_pull.push(SyncEntry {
-                path: entry.path.clone(),
-                hash: entry.hash,
-                size: entry.size,
-            });
+    if initial_direction.should_pull() {
+        for entry in &local_entries {
+            if entry.is_dir {
+                continue;
+            }
+            if !remote_map.contains_key(entry.path.as_str()) {
+                to_pull.push(SyncEntry {
+                    path: entry.path.clone(),
+                    hash: entry.hash,
+                    size: entry.size,
+                });
+            }
         }
     }
 

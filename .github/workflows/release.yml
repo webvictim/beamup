@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  AGENT_TARGET: aarch64-unknown-linux-musl
+
+jobs:
+  build-agent:
+    name: Build agent (aarch64-linux-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build agent
+        run: cross build --release --target ${{ env.AGENT_TARGET }} -p beamup-agent
+      - name: Upload agent artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: beamup-agent
+          path: target/${{ env.AGENT_TARGET }}/release/beamup-agent
+
+  build-cli:
+    name: Build CLI (${{ matrix.name }})
+    needs: build-agent
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - name: darwin-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: darwin-amd64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use-cross: true
+          - name: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use-cross: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Download agent artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: beamup-agent
+          path: agent-bin
+      - name: Install cross
+        if: matrix.use-cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build CLI
+        env:
+          BEAMUP_AGENT_PATH: ${{ github.workspace }}/agent-bin/beamup-agent
+        run: |
+          chmod +x "$BEAMUP_AGENT_PATH"
+          if [ "${{ matrix.use-cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p beamup-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p beamup-cli
+          fi
+      - name: Rename binary
+        run: |
+          cp target/${{ matrix.target }}/release/beamup beamup-${{ matrix.name }}
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: beamup-${{ matrix.name }}
+          path: beamup-${{ matrix.name }}
+
+  release:
+    name: Create release
+    needs: build-cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: beamup-*
+          merge-multiple: true
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.version }}
+          name: ${{ steps.tag.outputs.version }}
+          generate_release_notes: true
+          files: artifacts/beamup-*

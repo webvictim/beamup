@@ -15,6 +15,14 @@ Communication uses length-prefixed msgpack frames over stdin/stdout of the `tsh 
 
 ## Install
 
+### Homebrew
+
+```bash
+brew install webvictim/tap/beamup
+```
+
+### From source
+
 ```bash
 ./scripts/build.sh
 ```

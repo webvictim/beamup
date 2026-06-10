@@ -114,3 +114,5 @@ jobs:
           name: ${{ steps.tag.outputs.version }}
           generate_release_notes: true
           files: artifacts/beamup-*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

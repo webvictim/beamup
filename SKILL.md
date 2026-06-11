@@ -33,8 +33,29 @@ tsh -i /path/to/identity --proxy cluster.example.com:443 beams exec "$BEAM" -- m
 Key flags for agent use:
 - `-q` — suppress all log output (only errors to stderr)
 - `--oneshot` — exit after initial sync, print beam name to stdout
+- `-c 16` — use higher concurrency for faster transfers (see below)
 - `-i <path>` — use a Machine ID identity file instead of interactive login
 - `--proxy <addr>` — Teleport proxy address (required with `-i`)
+
+## Concurrency
+
+The default concurrency of 8 is conservative. Agents should use `-c 16` for significantly faster transfers:
+
+| Concurrency | Approx. throughput |
+|---|---|
+| 8 | ~22 MB/s |
+| 12 | ~29 MB/s |
+| 16 | ~35 MB/s |
+| 24 | ~44 MB/s |
+
+Higher concurrency can trigger reauthentication errors under interactive `tsh login` sessions, but Machine ID identity files are stable at high concurrency since they don't require interactive reauthentication. Transfers are retried automatically on failure (3 attempts with exponential backoff), so transient errors are handled gracefully.
+
+**Recommendation for agents:** Always use `-c 16` (or higher with Machine ID). Example:
+
+```bash
+BEAM=$(beamup -q -c 16 -i /path/to/identity --proxy cluster:443 \
+  start --oneshot --local-path ~/projects/myapp)
+```
 
 ## Interactive usage
 

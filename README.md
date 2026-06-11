@@ -154,13 +154,13 @@ Common patterns:
 ## Architecture
 
 ```
-┌─────────────┐          tsh beams exec          ┌─────────────┐
-│  beamup     │ ◄──── stdin/stdout pipe ────►    │ beamup-agent│
-│  (macOS)    │     msgpack length-prefixed      │ (linux/arm64)│
-│             │          frames                   │             │
-│ FSEvents    │                                   │ inotify     │
-│ watcher     │                                   │ watcher     │
-└─────────────┘                                   └─────────────┘
+┌─────────────┐        tsh beams exec        ┌───────────────┐
+│  beamup     │ ◄── stdin/stdout pipe ──►    │ beamup-agent  │
+│  (macOS)    │   msgpack length-prefixed    │ (linux/arm64) │
+│             │        frames                │               │
+│ FSEvents    │                              │ inotify       │
+│ watcher     │                              │ watcher       │
+└─────────────┘                              └───────────────┘
 ```
 
 ## Project structure

@@ -106,6 +106,24 @@ beamup -i /path/to/identity --proxy cluster.example.com:443 start --local-path ~
 
 This is required for headless/automated usage where no interactive `tsh login` session exists. The `TELEPORT_IDENTITY_FILE` env var is also respected by `tsh` directly.
 
+## Concurrency
+
+The `--concurrency` / `-c` flag controls how many parallel SCP transfers run simultaneously (default: 8). Higher values can significantly improve throughput:
+
+| Concurrency | Approx. throughput |
+|---|---|
+| 8 | ~22 MB/s |
+| 12 | ~29 MB/s |
+| 16 | ~35 MB/s |
+| 24 | ~44 MB/s |
+
+```bash
+# Faster transfers with higher concurrency
+beamup start -c 16 --local-path ~/projects/myapp
+```
+
+The default of 8 is conservative for stability — higher values can trigger `tsh` reauthentication errors under interactive login sessions. Transfers are retried automatically on failure, but frequent retries slow things down. Machine ID identity files are more stable at high concurrency since they don't require interactive reauthentication.
+
 ## Sync direction
 
 By default, beamup syncs bidirectionally. You can control the direction independently for the initial sync and ongoing sync:

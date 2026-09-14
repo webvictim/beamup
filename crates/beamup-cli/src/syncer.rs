@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::beam::Beam;
+use crate::beam::{AgentStderr, Beam};
 use crate::progress;
 use crate::transfer::TransferPool;
 use crate::transport::Transport;
@@ -42,9 +42,24 @@ pub struct SyncEngine {
     chunk_size: usize,
     initial_direction: SyncDirection,
     ongoing_direction: SyncDirection,
+    agent_stderr: AgentStderr,
 }
 
 impl SyncEngine {
+    /// Build the handshake failure message, folding in whatever the agent said on
+    /// stderr — an agent that fails to start is silent on stdout but loud here.
+    fn handshake_error(&self, got: impl std::fmt::Debug) -> anyhow::Error {
+        match self.agent_stderr.contents() {
+            Some(stderr) => anyhow::anyhow!(
+                "expected HelloAck, got: {got:?}\nagent stderr:\n{stderr}"
+            ),
+            None => anyhow::anyhow!(
+                "expected HelloAck, got: {got:?} (agent produced no stderr; \
+                 it may have failed to start on the beam)"
+            ),
+        }
+    }
+
     pub async fn new(
         beam_id: String,
         local_dir: PathBuf,
@@ -54,7 +69,7 @@ impl SyncEngine {
         initial_direction: SyncDirection,
         ongoing_direction: SyncDirection,
     ) -> Result<Self> {
-        let mut child = Beam::spawn_agent(&beam_id, &remote_dir)?;
+        let (mut child, agent_stderr) = Beam::spawn_agent(&beam_id, &remote_dir)?;
 
         let stdin = child.stdin.take().expect("agent stdin not captured");
         let stdout = child.stdout.take().expect("agent stdout not captured");
@@ -82,6 +97,7 @@ impl SyncEngine {
             chunk_size,
             initial_direction,
             ongoing_direction,
+            agent_stderr,
         })
     }
 
@@ -103,7 +119,7 @@ impl SyncEngine {
                 }
                 info!("handshake complete");
             }
-            other => anyhow::bail!("expected HelloAck, got: {other:?}"),
+            other => return Err(self.handshake_error(other)),
         }
 
         info!("performing initial sync...");
@@ -145,7 +161,7 @@ impl SyncEngine {
                 }
                 info!("handshake complete");
             }
-            other => anyhow::bail!("expected HelloAck, got: {other:?}"),
+            other => return Err(self.handshake_error(other)),
         }
 
         // Initial sync

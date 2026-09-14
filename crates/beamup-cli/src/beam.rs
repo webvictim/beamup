@@ -1,12 +1,37 @@
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
+
+/// Collected stderr lines from the remote agent, shared with the draining task.
+#[derive(Clone, Default)]
+pub struct AgentStderr(Arc<Mutex<Vec<String>>>);
+
+impl AgentStderr {
+    fn push(&self, line: String) {
+        if let Ok(mut lines) = self.0.lock() {
+            // Bound it; a chatty agent shouldn't grow this without limit.
+            if lines.len() < 100 {
+                lines.push(line);
+            }
+        }
+    }
+
+    /// Recent agent stderr, newline-joined, or None if it said nothing.
+    pub fn contents(&self) -> Option<String> {
+        let lines = self.0.lock().ok()?;
+        if lines.is_empty() {
+            return None;
+        }
+        Some(lines.join("\n"))
+    }
+}
 
 static IDENTITY_FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
 static PROXY: OnceLock<Option<String>> = OnceLock::new();
@@ -41,49 +66,119 @@ pub fn tsh_command_sync() -> std::process::Command {
     cmd
 }
 
-const EMBEDDED_AGENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/beamup-agent-embedded"));
+const EMBEDDED_AGENT_X86_64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/beamup-agent-x86_64"));
+const EMBEDDED_AGENT_AARCH64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/beamup-agent-aarch64"));
 
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
-fn agent_binary_path() -> Result<AgentBinary> {
-    // Check env var first (for development override)
-    if let Ok(path) = std::env::var("BEAMUP_AGENT_PATH") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Ok(AgentBinary::Path(p));
+/// Architecture of the remote beam, as reported by `uname -m`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeamArch {
+    X86_64,
+    Aarch64,
+}
+
+impl BeamArch {
+    fn parse(uname_m: &str) -> Result<Self> {
+        match uname_m.trim() {
+            "x86_64" | "amd64" => Ok(BeamArch::X86_64),
+            "aarch64" | "arm64" => Ok(BeamArch::Aarch64),
+            other => anyhow::bail!("unsupported beam architecture: {other}"),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            BeamArch::X86_64 => "x86_64",
+            BeamArch::Aarch64 => "aarch64",
+        }
+    }
+
+    fn target_triple(&self) -> &'static str {
+        match self {
+            BeamArch::X86_64 => "x86_64-unknown-linux-musl",
+            BeamArch::Aarch64 => "aarch64-unknown-linux-musl",
+        }
+    }
+
+    fn embedded(&self) -> &'static [u8] {
+        match self {
+            BeamArch::X86_64 => EMBEDDED_AGENT_X86_64,
+            BeamArch::Aarch64 => EMBEDDED_AGENT_AARCH64,
+        }
+    }
+}
+
+/// Ask the beam what architecture it is, so we deploy an agent that can actually exec.
+async fn detect_beam_arch(beam_id: &str) -> Result<BeamArch> {
+    let output = tsh_command()
+        .args(["beams", "exec", beam_id, "--", "uname", "-m"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("failed to run uname on beam")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to detect beam architecture: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // tsh may prepend its own chatter; the arch is the last non-empty line.
+    let line = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .next_back()
+        .unwrap_or("");
+    let arch = BeamArch::parse(line)?;
+    debug!("beam {beam_id} architecture: {}", arch.as_str());
+    Ok(arch)
+}
+
+fn agent_binary_path(arch: BeamArch) -> Result<AgentBinary> {
+    // Arch-specific env override, then the generic one (for development)
+    let arch_var = format!("BEAMUP_AGENT_PATH_{}", arch.as_str().to_uppercase());
+    for var in [arch_var.as_str(), "BEAMUP_AGENT_PATH"] {
+        if let Ok(path) = std::env::var(var) {
+            let p = PathBuf::from(path);
+            if p.exists() {
+                return Ok(AgentBinary::Path(p));
+            }
         }
     }
 
     // Check workspace target directory (development)
-    let candidates = [
-        "target/aarch64-unknown-linux-musl/release/beamup-agent",
-        "target/aarch64-unknown-linux-musl/debug/beamup-agent",
-    ];
-    for candidate in &candidates {
-        let p = PathBuf::from(candidate);
+    let triple = arch.target_triple();
+    for profile in ["release", "debug"] {
+        let p = PathBuf::from(format!("target/{triple}/{profile}/beamup-agent"));
         if p.exists() {
             return Ok(AgentBinary::Path(p));
         }
     }
 
     // Use embedded binary if available (non-empty)
-    if !EMBEDDED_AGENT.is_empty() {
-        return Ok(AgentBinary::Embedded(EMBEDDED_AGENT));
+    let embedded = arch.embedded();
+    if !embedded.is_empty() {
+        return Ok(AgentBinary::Embedded(embedded));
     }
 
     // Check next to our own binary (for installed/packaged deployments)
     if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.parent().unwrap_or(exe.as_ref()).join("beamup-agent");
-        if sibling.exists() {
-            return Ok(AgentBinary::Path(sibling));
+        let dir = exe.parent().unwrap_or(exe.as_ref());
+        for name in [format!("beamup-agent-{}", arch.as_str()), "beamup-agent".to_string()] {
+            let sibling = dir.join(name);
+            if sibling.exists() {
+                return Ok(AgentBinary::Path(sibling));
+            }
         }
     }
 
     anyhow::bail!(
-        "beamup-agent binary not found. Build it with: \
-         cross build --target aarch64-unknown-linux-musl -p beamup-agent\n\
-         Or set BEAMUP_AGENT_PATH to point to the binary."
+        "no beamup-agent binary for beam architecture {}. Build it with:\n  \
+         cargo build --release --target {triple} -p beamup-agent\n\
+         Or set {arch_var} to point to the binary.",
+        arch.as_str()
     )
 }
 
@@ -93,11 +188,12 @@ enum AgentBinary {
 }
 
 impl AgentBinary {
-    fn to_path(&self) -> Result<PathBuf> {
+    fn to_path(&self, arch: BeamArch) -> Result<PathBuf> {
         match self {
             AgentBinary::Path(p) => Ok(p.clone()),
             AgentBinary::Embedded(data) => {
-                let tmp = std::env::temp_dir().join("beamup-agent");
+                // Arch in the name so staged agents for different beams can't collide.
+                let tmp = std::env::temp_dir().join(format!("beamup-agent-{}", arch.as_str()));
                 std::fs::write(&tmp, data)?;
                 #[cfg(unix)]
                 {
@@ -182,13 +278,15 @@ impl Beam {
     }
 
     pub async fn deploy_agent(beam_id: &str, concurrency: usize) -> Result<()> {
-        let agent = agent_binary_path()?;
-        let agent_path = agent.to_path()?;
+        let arch = detect_beam_arch(beam_id).await?;
+        info!("beam architecture: {}", arch.as_str());
+        let agent = agent_binary_path(arch)?;
+        let agent_path = agent.to_path(arch)?;
         crate::transfer::deploy_agent_chunked(beam_id, &agent_path, concurrency).await
     }
 
-    pub fn spawn_agent(beam_id: &str, remote_dir: &str) -> Result<tokio::process::Child> {
-        let child = tsh_command()
+    pub fn spawn_agent(beam_id: &str, remote_dir: &str) -> Result<(tokio::process::Child, AgentStderr)> {
+        let mut child = tsh_command()
             .args([
                 "beams", "exec", beam_id, "--",
                 "/tmp/beamup-agent", "--serve", "--watch-dir", remote_dir,
@@ -199,8 +297,25 @@ impl Beam {
             .spawn()
             .context("failed to spawn agent via tsh beams exec")?;
 
+        // Drain stderr rather than letting it fill an unread pipe: if the agent dies
+        // at startup (wrong arch, missing binary) this is the only place that says why.
+        let stderr_log = AgentStderr::default();
+        if let Some(stderr) = child.stderr.take() {
+            let sink = stderr_log.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    warn!("agent stderr: {line}");
+                    sink.push(line);
+                }
+            });
+        }
+
         debug!("agent process spawned for beam {beam_id}");
-        Ok(child)
+        Ok((child, stderr_log))
     }
 
     pub async fn exec_interactive(beam_id: &str, cmd: &[String]) -> Result<ExitStatus> {

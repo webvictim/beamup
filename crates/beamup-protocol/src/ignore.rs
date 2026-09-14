@@ -128,6 +128,7 @@ mod tests {
         assert!(rules.is_ignored(Path::new("target/debug/deps/foo.o"), false));
         assert!(rules.is_ignored(Path::new("target/release/beamup"), false));
         assert!(rules.is_ignored(Path::new("target/aarch64-unknown-linux-musl/debug/beamup-agent"), false));
+        assert!(rules.is_ignored(Path::new("target/x86_64-unknown-linux-musl/release/beamup-agent"), false));
 
         assert!(!rules.is_ignored(Path::new("target_config.toml"), false));
 

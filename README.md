@@ -27,21 +27,28 @@ brew install webvictim/tap/beamup
 ./scripts/build.sh
 ```
 
-This cross-compiles the agent for linux/arm64, embeds it into the CLI binary, and produces `target/release/beamup` — a single self-contained binary.
+This cross-compiles the agent for both `linux/amd64` and `linux/arm64`, embeds both into the CLI binary, and produces `target/release/beamup` — a single self-contained binary. At deploy time the CLI runs `uname -m` on the beam and ships the matching agent, so one binary works against beams of either architecture.
 
-Requires [cross](https://github.com/cross-rs/cross) for the agent cross-compilation. To build just the CLI without embedding (for development):
+The agent cross-compilation uses [cross](https://github.com/cross-rs/cross) when it and a container engine are available, and otherwise falls back to a native `cargo build` using the musl toolchains:
+
+```bash
+brew install FiloSottile/musl-cross/musl-cross --with-aarch64
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+```
+
+To build just the CLI without embedding (for development):
 
 ```bash
 cargo build
 ```
 
-To cross-compile only the agent binary (without building the CLI):
+To build only one architecture (the CLI then can't serve beams of the other):
 
 ```bash
-cross build --release --target aarch64-unknown-linux-musl -p beamup-agent
+BEAMUP_ARCHS=x86_64 ./scripts/build.sh
 ```
 
-This produces `target/aarch64-unknown-linux-musl/release/beamup-agent`. Subsequent `cargo build` of the CLI will automatically embed it.
+Agents are read from `target/<triple>/release/beamup-agent`. Subsequent `cargo build` of the CLI automatically embeds whichever are present. `BEAMUP_AGENT_PATH_X86_64` / `BEAMUP_AGENT_PATH_AARCH64` override an individual arch.
 
 ## Usage
 

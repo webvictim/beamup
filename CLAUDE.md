@@ -34,7 +34,9 @@ beamup -q start --oneshot --local-path ~/project
 beamup -q -i /path/to/identity --proxy cluster:443 start --oneshot --local-path ~/project
 ```
 
-The build.rs auto-embeds the agent if found at `target/aarch64-unknown-linux-musl/release/beamup-agent`. Override with `BEAMUP_AGENT_PATH`. If no agent is found at build time, the CLI falls back to runtime lookup.
+The build.rs auto-embeds an agent per architecture, if found at `target/{x86_64,aarch64}-unknown-linux-musl/release/beamup-agent`. Override an individual arch with `BEAMUP_AGENT_PATH_X86_64` / `BEAMUP_AGENT_PATH_AARCH64` (plain `BEAMUP_AGENT_PATH` still overrides the host-native arch). If no agent is found at build time, the CLI falls back to runtime lookup.
+
+**Beam architecture.** Beams are not all the same arch — `Beam::deploy_agent` runs `uname -m` on the beam and picks the matching embedded agent. Deploying a mismatched agent makes it die with `Exec format error` on exec, which surfaces as a handshake failure, so don't hardcode a target triple in the deploy path.
 
 ## Architecture
 

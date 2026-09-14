@@ -3,7 +3,8 @@ members = ["crates/beamup-protocol", "crates/beamup-cli", "crates/beamup-agent"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+# Must match the release tag: scripts/check-version.sh enforces this in CI.
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 

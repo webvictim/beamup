@@ -15,24 +15,53 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  AGENT_TARGET: aarch64-unknown-linux-musl
 
 jobs:
-  build-agent:
-    name: Build agent (aarch64-linux-musl)
+  check-version:
+    name: Check version matches tag
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+      # beamup --version reads Cargo.toml, not the tag. Fail early rather than
+      # publish a binary that reports the wrong version (as v0.1.1 did).
+      - name: Verify Cargo.toml version
+        run: bash scripts/check-version.sh "${{ steps.tag.outputs.version }}"
+
+  build-agent:
+    name: Build agent (${{ matrix.arch }}-linux-musl)
+    needs: check-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Beams come in both architectures; the CLI embeds one agent for each
+        # and selects at deploy time from `uname -m` on the beam.
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross
       - name: Build agent
-        run: cross build --release --target ${{ env.AGENT_TARGET }} -p beamup-agent
+        run: cross build --release --target ${{ matrix.target }} -p beamup-agent
       - name: Upload agent artifact
         uses: actions/upload-artifact@v4
         with:
-          name: beamup-agent
-          path: target/${{ env.AGENT_TARGET }}/release/beamup-agent
+          name: agent-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/beamup-agent
 
   build-cli:
     name: Build CLI (${{ matrix.name }})
@@ -60,19 +89,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Download agent artifact
+      - name: Download agent artifacts
         uses: actions/download-artifact@v4
         with:
-          name: beamup-agent
+          pattern: agent-*
           path: agent-bin
       - name: Install cross
         if: matrix.use-cross
         run: cargo install cross --git https://github.com/cross-rs/cross
-      - name: Build CLI
-        env:
-          BEAMUP_AGENT_PATH: ${{ github.workspace }}/agent-bin/beamup-agent
+      # Put the agents where build.rs already looks, rather than pointing env
+      # vars at them: cross runs build.rs inside a container, where host paths
+      # and un-passed-through env vars would not resolve.
+      - name: Stage agents into target/
         run: |
-          chmod +x "$BEAMUP_AGENT_PATH"
+          for arch in x86_64 aarch64; do
+            dir="target/${arch}-unknown-linux-musl/release"
+            mkdir -p "$dir"
+            cp "agent-bin/agent-${arch}/beamup-agent" "$dir/beamup-agent"
+            chmod +x "$dir/beamup-agent"
+          done
+      - name: Build CLI
+        run: |
           if [ "${{ matrix.use-cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }} -p beamup-cli
           else
@@ -89,31 +126,25 @@ jobs:
 
   release:
     name: Create release
-    needs: build-cli
+    needs: [check-version, build-cli]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Download all artifacts
+      # Only the CLI binaries are release assets; the agent artifacts are an
+      # internal build input and are excluded here.
+      - name: Download CLI artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           pattern: beamup-*
           merge-multiple: true
-      - name: Determine tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: ${{ steps.tag.outputs.version }}
-          name: ${{ steps.tag.outputs.version }}
+          tag_name: ${{ needs.check-version.outputs.version }}
+          name: ${{ needs.check-version.outputs.version }}
           generate_release_notes: true
           files: artifacts/beamup-*

@@ -36,6 +36,10 @@ jobs:
       # publish a binary that reports the wrong version (as v0.1.1 did).
       - name: Verify Cargo.toml version
         run: bash scripts/check-version.sh "${{ steps.tag.outputs.version }}"
+      # Release bodies are CHANGELOG.md sections run through this; a regression
+      # there silently mangles the published notes.
+      - name: Test release-notes tooling
+        run: python3 tools/unwrap_md_test.py
 
   build-agent:
     name: Build agent (${{ matrix.arch }}-linux-musl)

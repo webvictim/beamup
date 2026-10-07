@@ -40,6 +40,36 @@ The build.rs auto-embeds an agent per architecture, if found at `target/{x86_64,
 
 **Beam architecture.** Beams are not all the same arch — `Beam::deploy_agent` runs `uname -m` on the beam and picks the matching embedded agent. Deploying a mismatched agent makes it die with `Exec format error` on exec, which surfaces as a handshake failure, so don't hardcode a target triple in the deploy path. The arch comes from the single probe exec (`probe_beam`), which also reports beamctl, the agents already present and the service state. Agents live at the content-addressed `/tmp/beamup-agent-<hash>`; use `beam::agent_remote_path()` rather than hardcoding a path.
 
+## Releasing
+
+Releases are cut by pushing a `vX.Y.Z` tag; `.github/workflows/release.yml`
+checks the tag against `Cargo.toml`, builds both agents and the four CLI
+binaries, and publishes the release.
+
+1. Bump `version` in `[workspace.package]` in `Cargo.toml` (and `Cargo.lock`)
+   to match the tag. `beamup --version` reads `Cargo.toml`, and
+   `scripts/check-version.sh` fails the release if they disagree.
+2. Add the version's section to the top of `CHANGELOG.md` (newest first,
+   Added / Changed / Fixed, plus its compare link at the bottom). Write it for
+   users rather than paraphrasing commit subjects: describe user-visible impact
+   and the symptom a fix cures, and say when an entry supersedes an earlier
+   one.
+3. Tag and push, then set the GitHub release body to that section with
+   `gh release edit vX.Y.Z --notes-file <file>`, followed by a
+   `**Full Changelog**: <compare link>` line. Don't leave releases with only
+   the auto-generated compare link.
+
+   **Unwrap first.** `CHANGELOG.md` is hard-wrapped to ~80 columns, but a
+   release body is free text and those breaks read badly there. Pipe the
+   section through `tools/unwrap-md.py`, which joins each bullet or paragraph
+   onto one line and leaves headings, lists, fenced code and indented
+   sub-paragraphs alone. Its tests (`python3 tools/unwrap_md_test.py`, also
+   run by the release workflow) cover the real `CHANGELOG.md` sections, so run
+   them after editing either.
+4. Update `Formula/beamup.rb` in the homebrew-tap repo: `version` and the
+   `sha256` of each of the four release binaries. Commit as
+   `beamup X.Y.Z: <summary>`.
+
 ## Architecture
 
 - `crates/beamup-protocol/` — Shared types, codec, hashing, ignore rules, compression

@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 # Must match the release tag: scripts/check-version.sh enforces this in CI.
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 

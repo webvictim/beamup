@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -120,6 +120,10 @@ async fn run_session(
     let ignore_rules = IgnoreRules::load(watch_dir);
     let mut file_states: HashMap<String, FileState> = HashMap::new();
     let mut suppress_set: HashMap<String, Instant> = HashMap::new();
+    // Paths the CLI is pushing to us, from the SyncPlan or a FileChanged until its
+    // FileReady. Whatever the watcher sees for them meanwhile is our own transfer
+    // half-written, and must never be echoed back as the file's content.
+    let mut incoming: HashSet<String> = HashSet::new();
 
     // Wait for Hello
     let (initial_direction, ongoing_direction) = match transport.recv().await? {
@@ -168,6 +172,7 @@ async fn run_session(
                             cache,
                             &mut file_states,
                             &mut suppress_set,
+                            &mut incoming,
                             initial_direction,
                         ).await?;
                     }
@@ -185,7 +190,8 @@ async fn run_session(
                             &transport,
                             watch_dir,
                             &mut file_states,
-                            &mut suppress_set,
+                            &suppress_set,
+                            &incoming,
                         ).await?;
                     }
                 }
@@ -258,6 +264,7 @@ async fn handle_message(
     cache: &mut HashCache,
     file_states: &mut HashMap<String, FileState>,
     suppress_set: &mut HashMap<String, Instant>,
+    incoming: &mut HashSet<String>,
     initial_direction: SyncDirection,
 ) -> Result<()> {
     match msg {
@@ -266,7 +273,7 @@ async fn handle_message(
         }
         Message::Pong => {}
         Message::FileManifest { entries } => {
-            handle_manifest(entries, transport, watch_dir, ignore_rules, cache, file_states, initial_direction).await?;
+            handle_manifest(entries, transport, watch_dir, ignore_rules, cache, file_states, incoming, initial_direction).await?;
         }
         Message::FileContent { path, hash, data } => {
             write_file(&path, &data, hash, watch_dir, file_states, suppress_set)?;
@@ -276,7 +283,9 @@ async fn handle_message(
             hash,
             size,
         } => {
-            // CLI has pushed a file via scp — update our state
+            // CLI has finished pushing a file (it also says so when the push failed) —
+            // record what actually landed, so later watcher events for it dedupe by hash
+            incoming.remove(&path);
             suppress_set.insert(path.clone(), Instant::now());
             let full_path = watch_dir.join(&path);
             let actual_hash = if full_path.exists() {
@@ -284,9 +293,10 @@ async fn handle_message(
             } else {
                 0
             };
-            let mtime = full_path
-                .metadata()
-                .and_then(|m| m.modified())
+            let metadata = full_path.metadata().ok();
+            let mtime = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
                 .unwrap_or(SystemTime::now())
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -296,7 +306,7 @@ async fn handle_message(
                 FileState {
                     hash: actual_hash,
                     mtime,
-                    size,
+                    size: metadata.map_or(size, |m| m.len()),
                 },
             );
             debug!("file ready (scp'd): {path} (expected hash {hash}, actual {actual_hash})");
@@ -311,7 +321,9 @@ async fn handle_message(
             mtime: _,
             size,
         } => {
-            // CLI is about to push this file via scp — add to suppress set
+            // CLI is about to push this file via scp — hold off reporting it until
+            // FileReady. A timed suppression alone expires mid-transfer on big files.
+            incoming.insert(path.clone());
             suppress_set.insert(path.clone(), Instant::now());
             debug!("file incoming via scp: {path} (size {size})");
         }
@@ -359,6 +371,7 @@ async fn handle_manifest(
     ignore_rules: &IgnoreRules,
     cache: &mut HashCache,
     file_states: &mut HashMap<String, FileState>,
+    incoming: &mut HashSet<String>,
     initial_direction: SyncDirection,
 ) -> Result<()> {
     let remote_map: HashMap<&str, &ManifestEntry> =
@@ -428,6 +441,9 @@ async fn handle_manifest(
             );
         }
     }
+
+    // The CLI is about to tar/scp these in; they're ours until it sends FileReady.
+    incoming.extend(to_push.iter().map(|e| e.path.clone()));
 
     // Send the sync plan
     transport
@@ -609,11 +625,12 @@ async fn handle_watch_event(
     transport: &Transport,
     watch_dir: &Path,
     file_states: &mut HashMap<String, FileState>,
-    suppress_set: &mut HashMap<String, Instant>,
+    suppress_set: &HashMap<String, Instant>,
+    incoming: &HashSet<String>,
 ) -> Result<()> {
     match event {
         WatchEvent::Modified(path) => {
-            if suppress_set.contains_key(&path) {
+            if suppress_set.contains_key(&path) || incoming.contains(&path) {
                 return Ok(());
             }
             let full_path = watch_dir.join(&path);
@@ -771,6 +788,107 @@ mod tests {
             Some(Ok(Message::HelloAck { version })) => assert_eq!(version, PROTOCOL_VERSION),
             other => panic!("expected HelloAck, got {other:?}"),
         }
+    }
+
+    /// Everything the agent sends within `window`.
+    async fn drain(conn: &mut Framed<UnixStream, MessageCodec>, window: Duration) -> Vec<Message> {
+        let mut msgs = Vec::new();
+        let deadline = tokio::time::Instant::now() + window;
+        while let Ok(Some(Ok(msg))) = tokio::time::timeout_at(deadline, conn.next()).await {
+            msgs.push(msg);
+        }
+        msgs
+    }
+
+    fn mentions(msg: &Message, path: &str) -> bool {
+        matches!(msg, Message::FileContent { path: p, .. } | Message::FileChanged { path: p, .. } if p == path)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pushed_file_is_not_echoed_back_while_it_is_being_written() {
+        use std::io::Write;
+
+        let dir = temp_dir("no-echo");
+        let watch_dir = dir.join("sync");
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let socket = dir.join("agent.sock");
+        tokio::spawn(listen(watch_dir.clone(), socket.clone()));
+
+        let mut conn = loop {
+            if let Ok(s) = UnixStream::connect(&socket).await {
+                break Framed::new(s, MessageCodec);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        conn.send(Message::Hello {
+            version: PROTOCOL_VERSION,
+            session_id: "push".into(),
+            initial_direction: SyncDirection::Bidirectional,
+            ongoing_direction: SyncDirection::Bidirectional,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(conn.next().await, Some(Ok(Message::HelloAck { .. }))));
+
+        // The CLI has a 2 MB file the beam lacks, so the plan says push it.
+        let full = vec![7u8; 2_000_000];
+        conn.send(Message::FileManifest {
+            entries: vec![ManifestEntry {
+                path: "big.bin".into(),
+                hash: hash_content(&full),
+                mtime: 0,
+                size: full.len() as u64,
+                is_dir: false,
+            }],
+        })
+        .await
+        .unwrap();
+        match conn.next().await {
+            Some(Ok(Message::SyncPlan { to_push, .. })) => assert_eq!(to_push.len(), 1),
+            other => panic!("expected SyncPlan, got {other:?}"),
+        }
+
+        // The push lands in pieces, as tar or scp would write it. While it's still
+        // under the inline threshold the old agent sent these partials back as
+        // FileContent, and the CLI wrote them over the full local file.
+        let mut f = std::fs::File::create(watch_dir.join("big.bin")).unwrap();
+        for chunk in full.chunks(16 * 1024).take(4) {
+            f.write_all(chunk).unwrap();
+            f.flush().unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for chunk in full.chunks(16 * 1024).skip(4) {
+            f.write_all(chunk).unwrap();
+        }
+        drop(f);
+        let echoed: Vec<_> = drain(&mut conn, Duration::from_millis(800))
+            .await
+            .into_iter()
+            .filter(|m| mentions(m, "big.bin"))
+            .collect();
+        assert!(echoed.is_empty(), "agent echoed our own push back: {echoed:?}");
+
+        // Once the CLI says the push is done, a real edit on the beam is reported.
+        conn.send(Message::FileReady {
+            path: "big.bin".into(),
+            hash: hash_content(&full),
+            size: full.len() as u64,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(SUPPRESS_DURATION + Duration::from_millis(100)).await;
+        std::fs::write(watch_dir.join("big.bin"), b"edited on the beam").unwrap();
+        let reported = drain(&mut conn, Duration::from_secs(2)).await;
+        assert!(
+            reported.iter().any(|m| matches!(
+                m,
+                Message::FileContent { path, data, .. } if path == "big.bin" && data == b"edited on the beam"
+            )),
+            "beam-side edit after FileReady was not reported: {reported:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

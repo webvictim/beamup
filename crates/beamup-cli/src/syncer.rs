@@ -738,12 +738,16 @@ impl SyncEngine {
 
         if !result.success {
             warn!("transfer failed: {} — {:?}", result.path, result.error);
-            return Ok(());
+            // A failed push still has to tell the agent it's over: since FileChanged
+            // the agent has been ignoring that path, and would keep doing so.
+            if !matches!(result.direction, crate::transfer::Direction::Push) {
+                return Ok(());
+            }
         }
 
         match result.direction {
             crate::transfer::Direction::Push => {
-                // We pushed a file to the beam — notify agent it's ready
+                // We pushed a file to the beam (or gave up) — notify agent it's done
                 if let Some(state) = self.file_states.get(&result.path) {
                     self.transport
                         .send(Message::FileReady {

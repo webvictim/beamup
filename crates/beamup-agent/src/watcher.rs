@@ -42,6 +42,11 @@ pub fn watch(
     loop {
         let events = inotify.read_events_blocking(&mut buffer)?;
 
+        // Nobody is listening any more (the session ended): stop rather than leak.
+        if tx.is_closed() {
+            return Ok(());
+        }
+
         for event in events {
             let Some(dir_path) = watches.get(&event.wd) else {
                 continue;

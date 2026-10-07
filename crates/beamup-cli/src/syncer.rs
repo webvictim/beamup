@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::beam::{AgentStderr, Beam};
+use crate::beam::{AgentMode, AgentStderr, Beam};
 use crate::progress;
 use crate::transfer::TransferPool;
 use crate::transport::Transport;
@@ -43,15 +43,27 @@ pub struct SyncEngine {
     initial_direction: SyncDirection,
     ongoing_direction: SyncDirection,
     agent_stderr: AgentStderr,
+    agent_service: Option<String>,
 }
 
 impl SyncEngine {
     /// Build the handshake failure message, folding in whatever the agent said on
-    /// stderr — an agent that fails to start is silent on stdout but loud here.
-    fn handshake_error(&self, got: impl std::fmt::Debug) -> anyhow::Error {
-        match self.agent_stderr.contents() {
-            Some(stderr) => anyhow::anyhow!(
-                "expected HelloAck, got: {got:?}\nagent stderr:\n{stderr}"
+    /// stderr — an agent that fails to start is silent on stdout but loud here. A
+    /// service agent logs to beamctl instead, so fetch that too.
+    async fn handshake_error(&self, got: impl std::fmt::Debug) -> anyhow::Error {
+        let mut output = self.agent_stderr.contents();
+        if let Some(name) = &self.agent_service {
+            if let Some(logs) = Beam::agent_service_logs(&self.beam_id, name).await {
+                let logs = format!("agent service {name} log:\n{logs}");
+                output = Some(match output {
+                    Some(stderr) => format!("{stderr}\n{logs}"),
+                    None => logs,
+                });
+            }
+        }
+        match output {
+            Some(output) => anyhow::anyhow!(
+                "expected HelloAck, got: {got:?}\nagent stderr:\n{output}"
             ),
             None => anyhow::anyhow!(
                 "expected HelloAck, got: {got:?} (agent produced no stderr; \
@@ -68,8 +80,9 @@ impl SyncEngine {
         chunk_size: usize,
         initial_direction: SyncDirection,
         ongoing_direction: SyncDirection,
+        agent_mode: &AgentMode,
     ) -> Result<Self> {
-        let (mut child, agent_stderr) = Beam::spawn_agent(&beam_id, &remote_dir)?;
+        let (mut child, agent_stderr) = Beam::spawn_agent(&beam_id, &remote_dir, agent_mode)?;
 
         let stdin = child.stdin.take().expect("agent stdin not captured");
         let stdout = child.stdout.take().expect("agent stdout not captured");
@@ -98,6 +111,7 @@ impl SyncEngine {
             initial_direction,
             ongoing_direction,
             agent_stderr,
+            agent_service: agent_mode.service_name().map(str::to_string),
         })
     }
 
@@ -119,7 +133,7 @@ impl SyncEngine {
                 }
                 info!("handshake complete");
             }
-            other => return Err(self.handshake_error(other)),
+            other => return Err(self.handshake_error(other).await),
         }
 
         info!("performing initial sync...");
@@ -161,7 +175,7 @@ impl SyncEngine {
                 }
                 info!("handshake complete");
             }
-            other => return Err(self.handshake_error(other)),
+            other => return Err(self.handshake_error(other).await),
         }
 
         // Initial sync

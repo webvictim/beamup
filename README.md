@@ -13,6 +13,8 @@ beamup runs two components:
 
 Communication uses length-prefixed msgpack frames over stdin/stdout of the `tsh beams exec` process. No ports consumed, no direct IP needed.
 
+On beams that run `beam-init` (which provides `beamctl`), the agent runs as a persistent service instead, and each `tsh beams exec` pipe is a thin relay to it — see [Persistent agent](#persistent-agent).
+
 ## Install
 
 ### Homebrew
@@ -86,7 +88,7 @@ beamup exec -- cargo test
 # Stop syncing and destroy the beam
 beamup down
 
-# Stop syncing but keep the beam alive
+# Stop syncing but keep the beam alive (also stops the persistent agent)
 beamup down --keep-beam
 ```
 
@@ -102,6 +104,19 @@ tsh beams exec "$BEAM" -- make build
 ```
 
 `--oneshot` is mutually exclusive with `--ongoing-sync` (there is no ongoing sync in this mode).
+
+On beams with `beamctl`, the agent stays running after a oneshot, so a later `beamup sync --oneshot --beam "$BEAM"` re-syncs quickly (see below).
+
+## Persistent agent
+
+When the beam has `beamctl` (beam-init's service manager), beamup runs the agent as a beamctl service, `beamup-<hash of remote path>`, labelled `app=beamup`. It keeps running between sessions, so reconnecting is much cheaper:
+
+- **No redeploy.** Agents are uploaded to a content-addressed path (`/tmp/beamup-agent-<hash>`), and a single probe exec checks the beam's architecture, whether `beamctl` is there, and whether the agent and its service already exist. An agent that's already there isn't uploaded again.
+- **No re-hashing.** The agent caches file hashes, keyed on inode, ctime, mtime and size, so on reconnect it only re-reads files that changed since the last session.
+
+Each session's `tsh beams exec` runs `beamup-agent --connect <socket>`, which relays the pipe to the service's Unix socket. The wire protocol is unchanged. If a second session connects to the same remote path, it takes over and the first one disconnects.
+
+The agent keeps running after Ctrl-C and after `--oneshot`, until `beamup down --keep-beam` stops it or the beam expires. Beams without `beamctl`, or runs with `--no-persistent-agent` (or `BEAMUP_PERSISTENT_AGENT=0`), use a per-session agent over the exec pipe, as before. Agent output goes to `beamctl logs beamup-<hash>`, and beamup includes it in handshake errors.
 
 ## Machine ID / identity file
 

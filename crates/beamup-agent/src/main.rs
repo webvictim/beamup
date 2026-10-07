@@ -1,3 +1,4 @@
+mod relay;
 mod transport;
 mod syncer;
 
@@ -17,6 +18,15 @@ struct Args {
     /// Run in sync server mode
     #[arg(long)]
     serve: bool,
+
+    /// With --serve: listen on this Unix socket and serve clients one after another,
+    /// instead of serving a single client over stdin/stdout
+    #[arg(long, requires = "serve")]
+    listen: Option<PathBuf>,
+
+    /// Relay stdin/stdout to an agent started with --listen on this socket
+    #[arg(long, conflicts_with = "serve")]
+    connect: Option<PathBuf>,
 
     /// Directory to watch/sync
     #[arg(long, default_value = "/home/beams/sync")]
@@ -131,10 +141,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(socket) = args.connect {
+        relay::run(&socket).await?;
+        // Exit outright: a pending blocking read on stdin would otherwise hold up
+        // runtime shutdown, and the client only sees EOF once we're gone.
+        std::process::exit(0);
+    }
+
     if !args.serve {
-        anyhow::bail!("agent must be run with --serve, --decompress, --compress, or --decompress-chunks");
+        anyhow::bail!("agent must be run with --serve, --connect, --decompress, --compress, or --decompress-chunks");
     }
 
     std::fs::create_dir_all(&args.watch_dir)?;
-    syncer::run(args.watch_dir).await
+    match args.listen {
+        Some(socket) => syncer::listen(args.watch_dir, socket).await,
+        None => syncer::run(args.watch_dir).await,
+    }
 }

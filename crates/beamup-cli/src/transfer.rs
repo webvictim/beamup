@@ -534,7 +534,7 @@ async fn push_file(
         Beam::exec_cmd(
             beam_id,
             &[
-                "/tmp/beamup-agent",
+                crate::beam::agent_remote_path(),
                 "--decompress-chunks",
                 remote_path,
                 &num_chunks.to_string(),
@@ -566,7 +566,7 @@ async fn pull_file(
     // Agent compresses + splits into /tmp/beamup-xfer/<fid>/
     let output = Beam::exec_cmd_output(
         beam_id,
-        &["/tmp/beamup-agent", "--compress", remote_path, &fid, "--chunk-size", &chunk_size.to_string()],
+        &[crate::beam::agent_remote_path(), "--compress", remote_path, &fid, "--chunk-size", &chunk_size.to_string()],
     )
     .await?;
 
@@ -635,21 +635,17 @@ async fn pull_file(
     Ok(())
 }
 
-/// Deploy the agent binary to the beam
-pub async fn deploy_agent_chunked(
-    beam_id: &str,
-    agent_path: &Path,
-    _concurrency: usize,
-) -> Result<()> {
-    // Remove existing agent binary to avoid SFTP failures when overwriting
-    let _ = Beam::exec_shell(beam_id, "rm -rf /tmp/beamup-agent /tmp/beamup-xfer && mkdir -p /tmp/beamup-xfer").await;
-
+/// Upload the agent binary to `remote_path` on the beam. It's staged under a unique
+/// name and moved into place, so a concurrent session never sees a partial binary and
+/// scp never has to overwrite an existing file.
+pub async fn upload_agent(beam_id: &str, agent_path: &Path, remote_path: &str) -> Result<()> {
+    let staging = format!("{remote_path}.{}.beamup-tmp", std::process::id());
     let size = agent_path.metadata()?.len();
 
     if size <= 50 * 1024 * 1024 {
         info!("deploying agent: {} bytes", size);
-        Beam::scp_to_beam(beam_id, agent_path, "/tmp/beamup-agent").await?;
-        Beam::exec_shell(beam_id, "chmod +x /tmp/beamup-agent").await?;
+        Beam::scp_to_beam(beam_id, agent_path, &staging).await?;
+        Beam::exec_shell(beam_id, &format!("chmod +x '{staging}' && mv -f '{staging}' '{remote_path}'")).await?;
     } else {
         use std::io::Write;
         use flate2::write::GzEncoder;
@@ -665,9 +661,13 @@ pub async fn deploy_agent_chunked(
 
         let local_tmp = std::env::temp_dir().join("beamup-agent-deploy.gz");
         std::fs::write(&local_tmp, &compressed)?;
-        Beam::scp_to_beam(beam_id, &local_tmp, "/tmp/beamup-agent.gz").await?;
+        Beam::scp_to_beam(beam_id, &local_tmp, &format!("{staging}.gz")).await?;
         let _ = std::fs::remove_file(&local_tmp);
-        Beam::exec_shell(beam_id, "gunzip -f /tmp/beamup-agent.gz && chmod +x /tmp/beamup-agent").await?;
+        Beam::exec_shell(
+            beam_id,
+            &format!("gunzip -f '{staging}.gz' && chmod +x '{staging}' && mv -f '{staging}' '{remote_path}'"),
+        )
+        .await?;
     }
 
     Ok(())

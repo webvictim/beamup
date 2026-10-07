@@ -9,6 +9,9 @@ pub struct Session {
     pub beam_id: String,
     pub local_dir: PathBuf,
     pub remote_dir: String,
+    /// beamctl service running this session's agent, if it's a persistent one.
+    #[serde(default)]
+    pub agent_service: Option<String>,
 }
 
 impl Session {

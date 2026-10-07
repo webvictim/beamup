@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use beamup_protocol::hash::{hash_content, hash_file};
 use beamup_protocol::ignore::IgnoreRules;
 use beamup_protocol::messages::{ManifestEntry, Message, SyncDirection, SyncEntry, INLINE_THRESHOLD, PROTOCOL_VERSION};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -24,9 +26,98 @@ struct FileState {
     size: u64,
 }
 
+/// A file's hash, valid for as long as its inode, ctime, mtime and size are unchanged.
+/// ctime can't be set from userspace, so any write since we hashed it shows up here.
+struct CachedHash {
+    ino: u64,
+    ctime_ns: i128,
+    mtime_ns: i128,
+    size: u64,
+    hash: u64,
+}
+
+impl CachedHash {
+    fn stamp(metadata: &std::fs::Metadata) -> (u64, i128, i128, u64) {
+        let ns = |secs: i64, nsec: i64| secs as i128 * 1_000_000_000 + nsec as i128;
+        (
+            metadata.ino(),
+            ns(metadata.ctime(), metadata.ctime_nsec()),
+            ns(metadata.mtime(), metadata.mtime_nsec()),
+            metadata.size(),
+        )
+    }
+}
+
+/// File hashes from the previous manifest, so a long-lived agent only re-reads files
+/// that changed since its last client connected. Empty for a one-shot stdio agent.
+#[derive(Default)]
+pub struct HashCache(HashMap<String, CachedHash>);
+
+/// How a session over one client connection ended.
+enum SessionEnd {
+    /// The client went away.
+    Closed,
+    /// A newer client connected; it takes over from the current one.
+    Superseded(UnixStream),
+}
+
+/// Serve a single client over stdin/stdout, as spawned directly by `tsh beams exec`.
 pub async fn run(watch_dir: PathBuf) -> Result<()> {
-    let mut transport = Transport::new();
-    let ignore_rules = IgnoreRules::load(&watch_dir);
+    let mut cache = HashCache::default();
+    let mut watch_rx = None;
+    run_session(Transport::stdio(), &watch_dir, &mut cache, &mut watch_rx, None).await?;
+    Ok(())
+}
+
+/// Serve clients on a Unix socket, one at a time, for as long as the process lives.
+/// Clients reach it through `--connect`; the newest connection always wins, so a client
+/// reconnecting after a dead link isn't stuck behind its own stale session.
+pub async fn listen(watch_dir: PathBuf, socket: PathBuf) -> Result<()> {
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket)
+        .with_context(|| format!("failed to listen on {}", socket.display()))?;
+    info!("listening on {}", socket.display());
+
+    let mut cache = HashCache::default();
+    let mut watch_rx = start_watcher(&watch_dir);
+    let mut next: Option<UnixStream> = None;
+
+    loop {
+        let stream = match next.take() {
+            Some(stream) => stream,
+            None => loop {
+                tokio::select! {
+                    conn = listener.accept() => match conn {
+                        Ok((stream, _)) => break stream,
+                        Err(e) => warn!("accept failed: {e}"),
+                    },
+                    // No client to forward to; the next client's manifest catches it up.
+                    _ = recv_watch(&mut watch_rx) => {}
+                }
+            },
+        };
+
+        let (reader, writer) = stream.into_split();
+        let transport = Transport::new(reader, writer);
+        match run_session(transport, &watch_dir, &mut cache, &mut watch_rx, Some(&listener)).await {
+            Ok(SessionEnd::Closed) => info!("client disconnected, waiting for the next one"),
+            Ok(SessionEnd::Superseded(stream)) => {
+                info!("new client connected, ending the current session");
+                next = Some(stream);
+            }
+            Err(e) => warn!("session ended with error: {e:#}"),
+        }
+    }
+}
+
+async fn run_session(
+    mut transport: Transport,
+    watch_dir: &Path,
+    cache: &mut HashCache,
+    watch_rx: &mut Option<mpsc::Receiver<WatchEvent>>,
+    listener: Option<&UnixListener>,
+) -> Result<SessionEnd> {
+    let ignore_rules = IgnoreRules::load(watch_dir);
     let mut file_states: HashMap<String, FileState> = HashMap::new();
     let mut suppress_set: HashMap<String, Instant> = HashMap::new();
 
@@ -54,20 +145,14 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
         other => anyhow::bail!("expected Hello, got: {other:?}"),
     };
 
-    // Set up watcher channel
-    #[allow(unused_variables)]
-    let (watch_tx, mut watch_rx) = mpsc::channel::<WatchEvent>(1024);
-
-    // Start filesystem watcher (only if ongoing sync pulls from beam)
-    #[cfg(target_os = "linux")]
-    if ongoing_direction.should_pull() {
-        let dir = watch_dir.clone();
-        let rules = IgnoreRules::load(&dir);
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = crate::watcher::watch(dir, rules, watch_tx) {
-                error!("watcher error: {e}");
-            }
-        });
+    // Start filesystem watcher (only if ongoing sync pulls from beam). A listening
+    // agent already has one running from startup.
+    if watch_rx.is_none() && ongoing_direction.should_pull() {
+        *watch_rx = start_watcher(watch_dir);
+    }
+    // Anything queued before this client arrived is covered by its manifest exchange.
+    if let Some(rx) = watch_rx.as_mut() {
+        while rx.try_recv().is_ok() {}
     }
 
     loop {
@@ -78,38 +163,91 @@ pub async fn run(watch_dir: PathBuf) -> Result<()> {
                         handle_message(
                             msg,
                             &transport,
-                            &watch_dir,
+                            watch_dir,
                             &ignore_rules,
+                            cache,
                             &mut file_states,
                             &mut suppress_set,
                             initial_direction,
                         ).await?;
                     }
                     None => {
-                        info!("transport closed, shutting down");
-                        break;
+                        info!("transport closed, ending session");
+                        return Ok(SessionEnd::Closed);
                     }
                 }
             }
-            event = watch_rx.recv() => {
+            event = recv_watch(watch_rx) => {
                 if let Some(event) = event {
                     if ongoing_direction.should_pull() {
                         handle_watch_event(
                             event,
                             &transport,
-                            &watch_dir,
+                            watch_dir,
                             &mut file_states,
                             &mut suppress_set,
                         ).await?;
                     }
                 }
             }
+            conn = accept(listener) => {
+                match conn {
+                    Ok(stream) => return Ok(SessionEnd::Superseded(stream)),
+                    Err(e) => warn!("accept failed: {e}"),
+                }
+            }
         }
 
         suppress_set.retain(|_, expiry| expiry.elapsed() < SUPPRESS_DURATION);
     }
+}
 
-    Ok(())
+fn start_watcher(watch_dir: &Path) -> Option<mpsc::Receiver<WatchEvent>> {
+    #[cfg(target_os = "linux")]
+    {
+        let (watch_tx, watch_rx) = mpsc::channel::<WatchEvent>(1024);
+        let dir = watch_dir.to_path_buf();
+        let rules = IgnoreRules::load(&dir);
+        // A plain thread, not spawn_blocking: runtime shutdown waits for blocking tasks,
+        // and this one sits in a blocking inotify read, so the agent could never exit.
+        let spawned = std::thread::Builder::new()
+            .name("watcher".into())
+            .spawn(move || {
+                if let Err(e) = crate::watcher::watch(dir, rules, watch_tx) {
+                    error!("watcher error: {e}");
+                }
+            });
+        if let Err(e) = spawned {
+            error!("failed to start watcher: {e}");
+            return None;
+        }
+        Some(watch_rx)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = watch_dir;
+        None
+    }
+}
+
+/// Next watcher event, or never if there is no watcher. A watcher that died is
+/// dropped rather than polled in a loop.
+async fn recv_watch(watch_rx: &mut Option<mpsc::Receiver<WatchEvent>>) -> Option<WatchEvent> {
+    let Some(rx) = watch_rx.as_mut() else {
+        return std::future::pending().await;
+    };
+    let event = rx.recv().await;
+    if event.is_none() {
+        *watch_rx = None;
+    }
+    event
+}
+
+async fn accept(listener: Option<&UnixListener>) -> std::io::Result<UnixStream> {
+    match listener {
+        Some(listener) => listener.accept().await.map(|(stream, _)| stream),
+        None => std::future::pending().await,
+    }
 }
 
 async fn handle_message(
@@ -117,6 +255,7 @@ async fn handle_message(
     transport: &Transport,
     watch_dir: &Path,
     ignore_rules: &IgnoreRules,
+    cache: &mut HashCache,
     file_states: &mut HashMap<String, FileState>,
     suppress_set: &mut HashMap<String, Instant>,
     initial_direction: SyncDirection,
@@ -127,7 +266,7 @@ async fn handle_message(
         }
         Message::Pong => {}
         Message::FileManifest { entries } => {
-            handle_manifest(entries, transport, watch_dir, ignore_rules, file_states, initial_direction).await?;
+            handle_manifest(entries, transport, watch_dir, ignore_rules, cache, file_states, initial_direction).await?;
         }
         Message::FileContent { path, hash, data } => {
             write_file(&path, &data, hash, watch_dir, file_states, suppress_set)?;
@@ -218,6 +357,7 @@ async fn handle_manifest(
     transport: &Transport,
     watch_dir: &Path,
     ignore_rules: &IgnoreRules,
+    cache: &mut HashCache,
     file_states: &mut HashMap<String, FileState>,
     initial_direction: SyncDirection,
 ) -> Result<()> {
@@ -225,7 +365,7 @@ async fn handle_manifest(
         remote_entries.iter().map(|e| (e.path.as_str(), e)).collect();
 
     // Build local manifest
-    let local_entries = build_manifest(watch_dir, ignore_rules)?;
+    let local_entries = build_manifest(watch_dir, ignore_rules, cache)?;
     let local_map: HashMap<&str, &ManifestEntry> =
         local_entries.iter().map(|e| (e.path.as_str(), e)).collect();
 
@@ -367,9 +507,16 @@ fn write_file(
     Ok(())
 }
 
-pub fn build_manifest(root: &Path, ignore_rules: &IgnoreRules) -> Result<Vec<ManifestEntry>> {
+pub fn build_manifest(
+    root: &Path,
+    ignore_rules: &IgnoreRules,
+    cache: &mut HashCache,
+) -> Result<Vec<ManifestEntry>> {
     let mut entries = Vec::new();
-    walk_dir(root, root, ignore_rules, &mut entries)?;
+    // Rebuilt from scratch each time so deleted files drop out of the cache.
+    let mut fresh = HashCache::default();
+    walk_dir(root, root, ignore_rules, cache, &mut fresh, &mut entries)?;
+    *cache = fresh;
     Ok(entries)
 }
 
@@ -377,6 +524,8 @@ fn walk_dir(
     base: &Path,
     dir: &Path,
     ignore_rules: &IgnoreRules,
+    cache: &mut HashCache,
+    fresh: &mut HashCache,
     entries: &mut Vec<ManifestEntry>,
 ) -> Result<()> {
     let read_dir = match std::fs::read_dir(dir) {
@@ -407,7 +556,7 @@ fn walk_dir(
                 size: 0,
                 is_dir: true,
             });
-            walk_dir(base, &path, ignore_rules, entries)?;
+            walk_dir(base, &path, ignore_rules, cache, fresh, entries)?;
         } else {
             let metadata = path.metadata()?;
             let mtime = metadata
@@ -417,7 +566,21 @@ fn walk_dir(
                 .unwrap_or_default()
                 .as_secs();
             let size = metadata.len();
-            let hash = hash_file(&path).unwrap_or(0);
+
+            let stamp = CachedHash::stamp(&metadata);
+            let hash = match cache.0.remove(&relative) {
+                Some(c) if (c.ino, c.ctime_ns, c.mtime_ns, c.size) == stamp => Some(c.hash),
+                _ => hash_file(&path).ok(),
+            };
+            // An unreadable file reports hash 0, as before, but isn't cached.
+            if let Some(hash) = hash {
+                let (ino, ctime_ns, mtime_ns, size) = stamp;
+                fresh.0.insert(
+                    relative.clone(),
+                    CachedHash { ino, ctime_ns, mtime_ns, size, hash },
+                );
+            }
+            let hash = hash.unwrap_or(0);
 
             entries.push(ManifestEntry {
                 path: relative,
@@ -520,4 +683,138 @@ async fn handle_watch_event(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beamup_protocol::codec::MessageCodec;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_util::codec::Framed;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("beamup-agent-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn manifest_hash(entries: &[ManifestEntry], path: &str) -> u64 {
+        entries.iter().find(|e| e.path == path).unwrap().hash
+    }
+
+    #[test]
+    fn manifest_reuses_cached_hash_for_untouched_file() {
+        let dir = temp_dir("cache-hit");
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let rules = IgnoreRules::load(&dir);
+        let mut cache = HashCache::default();
+
+        let first = build_manifest(&dir, &rules, &mut cache).unwrap();
+        assert_eq!(manifest_hash(&first, "a.txt"), hash_content(b"hello"));
+
+        // Plant a sentinel: if the file is re-read, the real hash comes back instead.
+        cache.0.get_mut("a.txt").unwrap().hash = 42;
+        let second = build_manifest(&dir, &rules, &mut cache).unwrap();
+        assert_eq!(manifest_hash(&second, "a.txt"), 42);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_rehashes_rewrite_with_same_size_and_mtime() {
+        let dir = temp_dir("cache-miss");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let rules = IgnoreRules::load(&dir);
+        let mut cache = HashCache::default();
+        build_manifest(&dir, &rules, &mut cache).unwrap();
+
+        // Same size, mtime put back: only ctime gives the change away.
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(&path, b"bbbb").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(mtime).unwrap();
+
+        let entries = build_manifest(&dir, &rules, &mut cache).unwrap();
+        assert_eq!(manifest_hash(&entries, "a.txt"), hash_content(b"bbbb"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_drops_deleted_files_from_cache() {
+        let dir = temp_dir("cache-delete");
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        let rules = IgnoreRules::load(&dir);
+        let mut cache = HashCache::default();
+        build_manifest(&dir, &rules, &mut cache).unwrap();
+        assert!(cache.0.contains_key("a.txt"));
+
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        build_manifest(&dir, &rules, &mut cache).unwrap();
+        assert!(cache.0.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    async fn hello(conn: &mut Framed<UnixStream, MessageCodec>, session_id: &str) {
+        conn.send(Message::Hello {
+            version: PROTOCOL_VERSION,
+            session_id: session_id.into(),
+            initial_direction: SyncDirection::Bidirectional,
+            ongoing_direction: SyncDirection::LocalToBeam,
+        })
+        .await
+        .unwrap();
+        match conn.next().await {
+            Some(Ok(Message::HelloAck { version })) => assert_eq!(version, PROTOCOL_VERSION),
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn listen_serves_reconnects_and_newest_client_wins() {
+        let dir = temp_dir("listen");
+        let watch_dir = dir.join("sync");
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let socket = dir.join("agent.sock");
+        tokio::spawn(listen(watch_dir, socket.clone()));
+
+        let connect = || async {
+            for _ in 0..50 {
+                if let Ok(s) = UnixStream::connect(&socket).await {
+                    return Framed::new(s, MessageCodec);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("agent never started listening");
+        };
+
+        // A client can connect, finish, and a later one is served by the same agent.
+        let mut first = connect().await;
+        hello(&mut first, "one").await;
+        drop(first);
+        let mut second = connect().await;
+        hello(&mut second, "two").await;
+
+        // A third client takes over; the second sees its connection close.
+        let mut third = connect().await;
+        hello(&mut third, "three").await;
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match second.next().await {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "superseded client was not disconnected");
+
+        third.send(Message::Ping).await.unwrap();
+        assert!(matches!(third.next().await, Some(Ok(Message::Pong))));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Args;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::beam::Beam;
 use crate::config::Session;
@@ -36,6 +36,10 @@ pub async fn run(args: DownArgs) -> Result<()> {
         Beam::destroy(&beam_id).await?;
         info!("beam destroyed");
     } else {
+        // A persistent agent would otherwise keep running on the kept beam.
+        if let Err(e) = Beam::stop_agent_services(&beam_id).await {
+            warn!("failed to stop agent service on {beam_id}: {e:#}");
+        }
         info!("stopped syncing (beam {beam_id} kept alive)");
     }
 

@@ -83,15 +83,20 @@ pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
     };
 
     // Save session
-    let session = Session {
+    let mut session = Session {
         beam_id: beam_id.clone(),
         local_dir: local_dir.clone(),
         remote_dir: args.remote_path.clone(),
+        agent_service: None,
     };
     session.save()?;
 
     info!("deploying agent to beam...");
-    Beam::deploy_agent(&beam_id, args.concurrency).await?;
+    let agent_mode = Beam::deploy_agent(&beam_id, &args.remote_path).await?;
+    if let Some(name) = agent_mode.service_name() {
+        session.agent_service = Some(name.to_string());
+        session.save()?;
+    }
 
     let chunk_size_bytes = args.chunk_size * 1024 * 1024;
 
@@ -105,6 +110,7 @@ pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
         chunk_size_bytes,
         args.initial_sync.into(),
         args.ongoing_sync.into(),
+        &agent_mode,
     )
     .await?;
 

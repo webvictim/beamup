@@ -36,7 +36,9 @@ beamup -q -i /path/to/identity --proxy cluster:443 start --oneshot --local-path 
 
 The build.rs auto-embeds an agent per architecture, if found at `target/{x86_64,aarch64}-unknown-linux-musl/release/beamup-agent`. Override an individual arch with `BEAMUP_AGENT_PATH_X86_64` / `BEAMUP_AGENT_PATH_AARCH64` (plain `BEAMUP_AGENT_PATH` still overrides the host-native arch). If no agent is found at build time, the CLI falls back to runtime lookup.
 
-**Beam architecture.** Beams are not all the same arch — `Beam::deploy_agent` runs `uname -m` on the beam and picks the matching embedded agent. Deploying a mismatched agent makes it die with `Exec format error` on exec, which surfaces as a handshake failure, so don't hardcode a target triple in the deploy path.
+**Persistent agent.** When the beam has `beamctl` (beam-init), `Beam::deploy_agent` runs the agent as a beamctl service, `beamup-<hash(remote_dir)>`, labelled `app=beamup`. It is started with `--serve --listen /tmp/beamup-<hash>.sock`, and each session spawns `beamup-agent --connect <sock>` over `tsh beams exec` as a byte relay, so the protocol is unchanged. The service persists until `down --keep-beam` and caches file hashes between sessions. Without beamctl, or with `--no-persistent-agent` / `BEAMUP_PERSISTENT_AGENT=0`, the agent serves one session over the exec pipe as before. Service processes get cwd `/home/beams` and a minimal env (no `BEAM_ID`/`TELEPORT_*`), and `beamctl start` refuses an existing name even when it has exited, so always `stop --prune` first.
+
+**Beam architecture.** Beams are not all the same arch — `Beam::deploy_agent` runs `uname -m` on the beam and picks the matching embedded agent. Deploying a mismatched agent makes it die with `Exec format error` on exec, which surfaces as a handshake failure, so don't hardcode a target triple in the deploy path. The arch comes from the single probe exec (`probe_beam`), which also reports beamctl, the agents already present and the service state. Agents live at the content-addressed `/tmp/beamup-agent-<hash>`; use `beam::agent_remote_path()` rather than hardcoding a path.
 
 ## Architecture
 
@@ -69,4 +71,5 @@ Protocol version 3. Messages are msgpack-encoded, length-prefixed (4-byte big-en
 - `.git/index` and `.git/index.lock` are never synced (platform-specific)
 - All `tsh` invocations go through `beam::tsh_command()` / `beam::tsh_command_sync()` helpers (prepend `-i` and `--proxy` when configured)
 - SCP and exec operations retry up to 3 times with exponential backoff on failure
-- `--oneshot` mode: handshake + initial sync only, then exit (no watcher, no ongoing loop)
+- `--oneshot` mode: handshake + initial sync only, then exit (no watcher, no ongoing loop); a persistent agent stays running
+- The agent's inotify watcher runs on a plain `std::thread`, not `spawn_blocking`: tokio's runtime shutdown waits for blocking tasks, which kept agents alive after their session ended

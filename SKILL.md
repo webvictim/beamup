@@ -30,6 +30,12 @@ BEAM=$(beamup -q -i /path/to/identity --proxy cluster.example.com:443 \
 tsh -i /path/to/identity --proxy cluster.example.com:443 beams exec "$BEAM" -- make build
 ```
 
+Re-syncing an existing beam is cheap on beams with `beamctl`. The agent keeps running between runs, so it isn't redeployed and only changed files are re-hashed:
+
+```bash
+beamup -q sync --oneshot --beam "$BEAM" --local-path ~/projects/myapp
+```
+
 Key flags for agent use:
 - `-q` — suppress all log output (only errors to stderr)
 - `--oneshot` — exit after initial sync, print beam name to stdout
@@ -107,6 +113,7 @@ Values: `local-to-beam`, `beam-to-local`, `bidirectional`
 | `--concurrency N` | Max parallel SCP transfers (default: 8) |
 | `--chunk-size N` | Chunk size in MB for large files (default: 64) |
 | `-v` / `--verbose` | Show debug-level transfer logs |
+| `--no-persistent-agent` | Don't keep the agent running between sessions as a beamctl service (also `BEAMUP_PERSISTENT_AGENT=0`) |
 
 ## Commands
 
@@ -115,7 +122,7 @@ beamup start [OPTIONS]     # Create beam + start syncing
 beamup sync [OPTIONS]      # Sync with existing beam (no create)
 beamup exec -- <cmd>       # Run command in synced beam
 beamup status              # Show sync status
-beamup down [--keep-beam]  # Stop sync, optionally keep beam alive
+beamup down [--keep-beam]  # Stop sync, optionally keep beam alive (stops the persistent agent)
 ```
 
 ## How files are synced
@@ -131,6 +138,7 @@ beamup respects `.gitignore` and an optional `.beamignore` file (same syntax). A
 ## Troubleshooting
 
 - **"agent protocol version mismatch"** — Rebuild and redeploy the agent (`./scripts/build-agent.sh`)
+- **Handshake failure with a persistent agent** — the error includes `beamctl logs` output. Check `tsh beams exec <beam> -- beamctl list`, or retry with `--no-persistent-agent`
 - **"beam not found"** — Check `tsh beams ls`; beams expire after 24h
 - **git segfault after sync** — Run `git status` to rebuild the index; this was caused by syncing .git/index cross-platform (now fixed)
 - **Progress bar not moving** — Large files update per-chunk (64MB); very large files with few chunks may appear slow

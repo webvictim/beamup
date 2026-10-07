@@ -35,6 +35,11 @@ struct Cli {
     /// Teleport proxy address (required when using --identity)
     #[arg(long, global = true)]
     proxy: Option<String>,
+
+    /// Run the beam agent only for the duration of each session, even when the beam
+    /// has beamctl to keep it running between sessions (also: BEAMUP_PERSISTENT_AGENT=0)
+    #[arg(long, global = true)]
+    no_persistent_agent: bool,
 }
 
 #[derive(Subcommand)]
@@ -56,6 +61,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     beam::set_identity_file(cli.identity, cli.proxy);
+    let persistent_env_off = std::env::var("BEAMUP_PERSISTENT_AGENT").is_ok_and(|v| v == "0");
+    beam::set_persistent_agent(!cli.no_persistent_agent && !persistent_env_off);
 
     let filter = if cli.verbose {
         "beamup=debug,beamup_protocol=debug"

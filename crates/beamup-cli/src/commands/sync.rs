@@ -68,12 +68,13 @@ pub async fn run(args: SyncArgs) -> Result<()> {
 
     // Deploy agent (in case it's not running)
     info!("deploying agent...");
-    Beam::deploy_agent(&beam_id, args.concurrency).await?;
+    let agent_mode = Beam::deploy_agent(&beam_id, &args.remote_path).await?;
 
     let session = Session {
         beam_id: beam_id.clone(),
         local_dir: local_dir.clone(),
         remote_dir: args.remote_path.clone(),
+        agent_service: agent_mode.service_name().map(str::to_string),
     };
     session.save()?;
 
@@ -88,6 +89,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
         chunk_size_bytes,
         args.initial_sync.into(),
         args.ongoing_sync.into(),
+        &agent_mode,
     )
     .await?;
 

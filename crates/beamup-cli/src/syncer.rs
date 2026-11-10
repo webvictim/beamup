@@ -36,6 +36,8 @@ pub struct SyncEngine {
     transport: Transport,
     transfer_pool: TransferPool,
     ignore_rules: IgnoreRules,
+    /// `--exclude` patterns, already in `ignore_rules`; sent to the agent in Hello.
+    excludes: Vec<String>,
     file_states: HashMap<String, FileState>,
     suppress_set: HashMap<String, Instant>,
     in_flight: HashSet<String>,
@@ -80,15 +82,16 @@ impl SyncEngine {
         chunk_size: usize,
         initial_direction: SyncDirection,
         ongoing_direction: SyncDirection,
+        excludes: Vec<String>,
         agent_mode: &AgentMode,
     ) -> Result<Self> {
+        let ignore_rules = IgnoreRules::with_excludes(&local_dir, &excludes)?;
         let (mut child, agent_stderr) = Beam::spawn_agent(&beam_id, &remote_dir, agent_mode)?;
 
         let stdin = child.stdin.take().expect("agent stdin not captured");
         let stdout = child.stdout.take().expect("agent stdout not captured");
 
         let transport = Transport::new(stdout, stdin);
-        let ignore_rules = IgnoreRules::load(&local_dir);
         let transfer_pool = TransferPool::new(
             beam_id.clone(),
             local_dir.clone(),
@@ -104,6 +107,7 @@ impl SyncEngine {
             transport,
             transfer_pool,
             ignore_rules,
+            excludes,
             file_states: HashMap::new(),
             suppress_set: HashMap::new(),
             in_flight: HashSet::new(),
@@ -123,6 +127,7 @@ impl SyncEngine {
                 session_id: session_id.clone(),
                 initial_direction: self.initial_direction,
                 ongoing_direction: self.ongoing_direction,
+                excludes: self.excludes.clone(),
             })
             .await?;
 
@@ -165,6 +170,7 @@ impl SyncEngine {
                 session_id: session_id.clone(),
                 initial_direction: self.initial_direction,
                 ongoing_direction: self.ongoing_direction,
+                excludes: self.excludes.clone(),
             })
             .await?;
 

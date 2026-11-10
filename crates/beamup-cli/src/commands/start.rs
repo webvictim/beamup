@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use beamup_protocol::ignore::IgnoreRules;
 use clap::Args;
 use tokio::sync::oneshot;
 use tracing::info;
@@ -34,8 +35,9 @@ pub struct StartArgs {
     #[arg(short, long, default_value = "8")]
     pub concurrency: usize,
 
-    /// Additional exclude patterns
-    #[arg(long)]
+    /// Leave matching paths out of the sync, in both directions (gitignore syntax,
+    /// relative to the synced directory; repeatable). `.tsh/`, `.kube/` and `.cache/` are always excluded.
+    #[arg(long, value_name = "PATTERN")]
     pub exclude: Vec<String>,
 
     /// Chunk size in MB for large file transfers (default: 64)
@@ -73,6 +75,9 @@ pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
         anyhow::bail!("path is not a directory: {}", local_dir.display());
     }
 
+    // Check the patterns before creating a beam that a typo would leave idle.
+    IgnoreRules::with_excludes(&local_dir, &args.exclude)?;
+
     // Create or use existing beam
     let beam_id = if let Some(id) = args.beam {
         info!("using existing beam: {id}");
@@ -94,6 +99,7 @@ pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
         local_dir: local_dir.clone(),
         remote_dir: remote_dir.clone(),
         agent_service: None,
+        excludes: args.exclude.clone(),
     };
     session.save()?;
 
@@ -116,6 +122,7 @@ pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
         chunk_size_bytes,
         args.initial_sync.into(),
         args.ongoing_sync.into(),
+        args.exclude,
         &agent_mode,
     )
     .await?;

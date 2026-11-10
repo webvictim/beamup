@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use beamup_protocol::ignore::IgnoreRules;
 use clap::Args;
 use tracing::info;
 
@@ -29,6 +30,13 @@ pub struct SyncArgs {
     #[arg(short, long, default_value = "8")]
     pub concurrency: usize,
 
+    /// Leave matching paths out of the sync, in both directions (gitignore syntax,
+    /// relative to the synced directory; repeatable). `.tsh/`, `.kube/` and `.cache/` are always excluded.
+    /// Omit to reuse the active session's patterns when syncing the same
+    /// directories with the same beam.
+    #[arg(long, value_name = "PATTERN")]
+    pub exclude: Vec<String>,
+
     /// Chunk size in MB for large file transfers (default: 64)
     #[arg(long, default_value = "64")]
     pub chunk_size: usize,
@@ -47,14 +55,11 @@ pub struct SyncArgs {
 }
 
 pub async fn run(args: SyncArgs) -> Result<()> {
-    let beam_id = if let Some(id) = args.beam {
-        id
-    } else {
-        let session = Session::load()?;
-        match session {
-            Some(s) => s.beam_id,
-            None => anyhow::bail!("no active session — specify --beam"),
-        }
+    let saved = Session::load()?;
+    let beam_id = match (args.beam, &saved) {
+        (Some(id), _) => id,
+        (None, Some(s)) => s.beam_id.clone(),
+        (None, None) => anyhow::bail!("no active session — specify --beam"),
     };
 
     let local_dir = args
@@ -65,6 +70,12 @@ pub async fn run(args: SyncArgs) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot resolve --local-path {}", local_dir.display()))?;
     let remote_dir = paths::expand_remote(&args.remote_path)?;
+
+    let excludes = resolve_excludes(args.exclude, saved.as_ref(), &beam_id, &local_dir, &remote_dir);
+    IgnoreRules::with_excludes(&local_dir, &excludes)?;
+    if !excludes.is_empty() {
+        info!("excluding: {}", excludes.join(", "));
+    }
 
     // Verify beam exists
     let beams = Beam::list().await?;
@@ -81,6 +92,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
         local_dir: local_dir.clone(),
         remote_dir: remote_dir.clone(),
         agent_service: agent_mode.service_name().map(str::to_string),
+        excludes: excludes.clone(),
     };
     session.save()?;
 
@@ -95,6 +107,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
         chunk_size_bytes,
         args.initial_sync.into(),
         args.ongoing_sync.into(),
+        excludes,
         &agent_mode,
     )
     .await?;
@@ -106,4 +119,80 @@ pub async fn run(args: SyncArgs) -> Result<()> {
     }
 
     engine.run(None).await
+}
+
+/// `--exclude` patterns given on the command line win. Without any, reuse the saved
+/// session's, but only for the same beam and directories: they're relative to the
+/// synced directory, so they mean something else anywhere else.
+fn resolve_excludes(
+    given: Vec<String>,
+    saved: Option<&Session>,
+    beam_id: &str,
+    local_dir: &Path,
+    remote_dir: &str,
+) -> Vec<String> {
+    if !given.is_empty() {
+        return given;
+    }
+    match saved {
+        Some(s) if s.beam_id == beam_id && s.local_dir == local_dir && s.remote_dir == remote_dir => {
+            s.excludes.clone()
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(excludes: &[&str]) -> Session {
+        Session {
+            beam_id: "beam-1".into(),
+            local_dir: PathBuf::from("/Users/me/project"),
+            remote_dir: "/home/beams/sync".into(),
+            agent_service: None,
+            excludes: excludes.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn resolve(given: &[&str], saved: Option<&Session>, beam: &str, local: &str, remote: &str) -> Vec<String> {
+        let given = given.iter().map(|s| s.to_string()).collect();
+        resolve_excludes(given, saved, beam, Path::new(local), remote)
+    }
+
+    #[test]
+    fn reuses_saved_excludes_for_the_same_session() {
+        let saved = session(&["*.sqlite", "build/"]);
+        assert_eq!(
+            resolve(&[], Some(&saved), "beam-1", "/Users/me/project", "/home/beams/sync"),
+            vec!["*.sqlite", "build/"]
+        );
+    }
+
+    #[test]
+    fn given_excludes_replace_saved_ones() {
+        let saved = session(&["*.sqlite"]);
+        assert_eq!(
+            resolve(&["*.log"], Some(&saved), "beam-1", "/Users/me/project", "/home/beams/sync"),
+            vec!["*.log"]
+        );
+    }
+
+    #[test]
+    fn saved_excludes_are_not_carried_to_another_session() {
+        let saved = session(&["*.sqlite"]);
+        let none: Vec<String> = Vec::new();
+        assert_eq!(resolve(&[], Some(&saved), "beam-2", "/Users/me/project", "/home/beams/sync"), none);
+        assert_eq!(resolve(&[], Some(&saved), "beam-1", "/Users/me/other", "/home/beams/sync"), none);
+        assert_eq!(resolve(&[], Some(&saved), "beam-1", "/Users/me/project", "/home/beams"), none);
+        assert_eq!(resolve(&[], None, "beam-1", "/Users/me/project", "/home/beams/sync"), none);
+    }
+
+    #[test]
+    fn sessions_saved_before_excludes_existed_still_load() {
+        let json = r#"{"beam_id":"b","local_dir":"/x","remote_dir":"/y","agent_service":null}"#;
+        let s: Session = serde_json::from_str(json).unwrap();
+        assert!(s.excludes.is_empty());
+    }
 }

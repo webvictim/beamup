@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Threshold below which files are sent inline via the pipe.
 /// Above this, scp is used for transfer.
@@ -33,6 +33,10 @@ pub enum Message {
         initial_direction: SyncDirection,
         #[serde(default)]
         ongoing_direction: SyncDirection,
+        /// `--exclude` patterns, so the agent leaves the same paths out of its
+        /// manifest and watch events as the CLI does.
+        #[serde(default)]
+        excludes: Vec<String>,
     },
     HelloAck {
         version: u32,
@@ -136,18 +140,20 @@ mod tests {
     fn all_variants_serialize() {
         let messages = vec![
             Message::Hello {
-                version: 3,
+                version: PROTOCOL_VERSION,
                 session_id: "test".into(),
                 initial_direction: SyncDirection::Bidirectional,
                 ongoing_direction: SyncDirection::Bidirectional,
+                excludes: vec![],
             },
             Message::Hello {
-                version: 3,
+                version: PROTOCOL_VERSION,
                 session_id: "directed".into(),
                 initial_direction: SyncDirection::LocalToBeam,
                 ongoing_direction: SyncDirection::BeamToLocal,
+                excludes: vec!["*.sqlite".into(), "/build/".into()],
             },
-            Message::HelloAck { version: 3 },
+            Message::HelloAck { version: PROTOCOL_VERSION },
             Message::FileManifest { entries: vec![
                 ManifestEntry { path: "a/b.rs".into(), hash: 42, mtime: 1000, size: 500, is_dir: false },
             ]},

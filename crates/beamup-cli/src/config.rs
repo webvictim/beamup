@@ -12,6 +12,10 @@ pub struct Session {
     /// beamctl service running this session's agent, if it's a persistent one.
     #[serde(default)]
     pub agent_service: Option<String>,
+    /// `--exclude` patterns the session was started with, so `beamup sync`
+    /// reconnects with the same ones.
+    #[serde(default)]
+    pub excludes: Vec<String>,
 }
 
 impl Session {

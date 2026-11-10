@@ -133,7 +133,7 @@ beamup down [--keep-beam]  # Stop sync, optionally keep beam alive (stops the pe
 
 ## Ignoring files
 
-beamup respects `.gitignore` and an optional `.beamignore` file (same syntax). Additionally, `.git/index` and `.git/index.lock` are always excluded (platform-specific binary format).
+beamup respects `.gitignore` and an optional `.beamignore` file (same syntax), plus any `--exclude <pattern>` given to `start` or `sync` (repeatable; `sync` reuses the session's patterns when none are given). Additionally, `.git/index` and `.git/index.lock` are always excluded (platform-specific binary format), and so are `.tsh/`, `.kube/` and `.cache/` directories: a tsh profile copied from another beam makes tsh sign with the wrong key, and Beam commands fail with `tls: error decrypting message`; a kubeconfig points at that profile; caches are big and platform-specific.
 
 ## Troubleshooting
 

@@ -1,14 +1,68 @@
 use std::path::{Path, PathBuf};
 
+use anyhow::{bail, Context};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+/// Never synced, and checked before `--exclude`, `.gitignore` and `.beamignore`, so a
+/// `!` pattern in those can't bring them back.
+const BUILTIN_PATTERNS: &[&str] = &[
+    // beamup's own in-flight transfer files.
+    "*.beamup-tmp",
+    "*.beamup-pull-tmp",
+    "*.beamup-chunk-*",
+    "*.beamup-lz4",
+    "*.beamup-lz4-chunk-*",
+    "*.beamup-chunk-tmp",
+    // Platform-specific binary formats.
+    ".git/index",
+    ".git/index.lock",
+    ".git/modules/**/index",
+    ".git/modules/**/index.lock",
+    // tsh profiles. A beam's certificate is only usable with the private key its
+    // own tbot holds in memory, so a profile carried to another beam (or baked
+    // into a Phase snapshot) makes tsh sign with the wrong key, and every Beam
+    // command there fails with "tls: error decrypting message".
+    ".tsh/",
+    // kubeconfigs written by tsh point at the local tsh profile and this beam's
+    // cluster. Syncing one either way leaves the other side with the wrong
+    // credentials, or overwrites a laptop's real ~/.kube/config.
+    ".kube/",
+    // Caches: large, rebuildable, and full of platform-specific output.
+    ".cache/",
+];
 
 pub struct IgnoreRules {
     rules: Vec<Gitignore>,
 }
 
 impl IgnoreRules {
+    /// Rules for `root`: the built-ins, then `.gitignore` and `.beamignore`.
     pub fn load(root: &Path) -> Self {
+        Self::with_excludes(root, &[]).expect("built-in ignore patterns are valid")
+    }
+
+    /// Like [`IgnoreRules::load`], plus `--exclude` patterns (gitignore syntax,
+    /// relative to `root`). Excludes are checked after the built-ins and before the
+    /// files, so a `!` line in `.gitignore` or `.beamignore` can't undo one.
+    pub fn with_excludes(root: &Path, excludes: &[String]) -> anyhow::Result<Self> {
         let mut rules = Vec::new();
+
+        let mut builder = GitignoreBuilder::new(root);
+        for pattern in BUILTIN_PATTERNS {
+            builder.add_line(None, pattern)?;
+        }
+        rules.push(builder.build()?);
+
+        if !excludes.is_empty() {
+            let mut builder = GitignoreBuilder::new(root);
+            for pattern in excludes {
+                validate_exclude(pattern)?;
+                builder
+                    .add_line(None, pattern)
+                    .with_context(|| format!("invalid --exclude pattern {pattern:?}"))?;
+            }
+            rules.push(builder.build().context("invalid --exclude patterns")?);
+        }
 
         // Load .gitignore
         let gitignore_path = root.join(".gitignore");
@@ -30,23 +84,7 @@ impl IgnoreRules {
             }
         }
 
-        // Always ignore beamup internals and platform-specific git files
-        let mut builder = GitignoreBuilder::new(root);
-        let _ = builder.add_line(None, "*.beamup-tmp");
-        let _ = builder.add_line(None, "*.beamup-pull-tmp");
-        let _ = builder.add_line(None, "*.beamup-chunk-*");
-        let _ = builder.add_line(None, "*.beamup-lz4");
-        let _ = builder.add_line(None, "*.beamup-lz4-chunk-*");
-        let _ = builder.add_line(None, "*.beamup-chunk-tmp");
-        let _ = builder.add_line(None, ".git/index");
-        let _ = builder.add_line(None, ".git/index.lock");
-        let _ = builder.add_line(None, ".git/modules/**/index");
-        let _ = builder.add_line(None, ".git/modules/**/index.lock");
-        if let Ok(gi) = builder.build() {
-            rules.push(gi);
-        }
-
-        Self { rules }
+        Ok(Self { rules })
     }
 
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
@@ -77,6 +115,22 @@ impl IgnoreRules {
 
 pub fn relative_path(root: &Path, full_path: &Path) -> PathBuf {
     full_path.strip_prefix(root).unwrap_or(full_path).to_path_buf()
+}
+
+/// Reject `--exclude` values that gitignore would silently treat as something
+/// other than an exclusion.
+fn validate_exclude(pattern: &str) -> anyhow::Result<()> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        bail!("--exclude pattern is empty");
+    }
+    if trimmed.starts_with('!') {
+        bail!("--exclude pattern {pattern:?} starts with '!'; negations belong in .beamignore");
+    }
+    if trimmed.starts_with('#') {
+        bail!("--exclude pattern {pattern:?} starts with '#', which gitignore reads as a comment; write \\# to match a literal '#'");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -210,6 +264,140 @@ mod tests {
         assert!(!rules.is_ignored(Path::new(".git/HEAD"), false));
         assert!(!rules.is_ignored(Path::new(".git/config"), false));
         assert!(!rules.is_ignored(Path::new(".git/refs/heads/main"), false));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ignores_tsh_profiles() {
+        let root = setup_test_dir("ignore-tsh");
+        let rules = IgnoreRules::load(&root);
+
+        // ~/.tsh when the sync root is the home directory...
+        assert!(rules.is_ignored(Path::new(".tsh"), true));
+        assert!(rules.is_ignored(Path::new(".tsh/keys/odd-firefly.beams.sh/bot-beam-x-x509.pem"), false));
+        assert!(rules.is_ignored(Path::new(".tsh/odd-firefly.beams.sh.yaml"), false));
+        // ...and a home directory's .tsh when the sync root is above it.
+        assert!(rules.is_ignored(Path::new("beams/.tsh/current-profile"), false));
+
+        // Only the directory, and only that name.
+        assert!(!rules.is_ignored(Path::new(".tsh"), false));
+        assert!(!rules.is_ignored(Path::new(".tsh.from-pi"), true));
+        assert!(!rules.is_ignored(Path::new("scripts/setup.tsh"), false));
+        assert!(!rules.is_ignored(Path::new("docs/tsh/usage.md"), false));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ignores_kube_and_cache_dirs() {
+        let root = setup_test_dir("ignore-kube-cache");
+        let rules = IgnoreRules::load(&root);
+
+        assert!(rules.is_ignored(Path::new(".kube"), true));
+        assert!(rules.is_ignored(Path::new(".kube/config"), false));
+        assert!(rules.is_ignored(Path::new("beams/.kube/cache/discovery/x.json"), false));
+        assert!(rules.is_ignored(Path::new(".cache"), true));
+        assert!(rules.is_ignored(Path::new(".cache/pip/http/x"), false));
+        // Project-level caches too.
+        assert!(rules.is_ignored(Path::new("web/node_modules/.cache/babel/x"), false));
+        assert!(rules.is_ignored(Path::new("project/.cache/x"), false));
+
+        // Only directories with exactly those names.
+        assert!(!rules.is_ignored(Path::new(".kube"), false));
+        assert!(!rules.is_ignored(Path::new(".cache"), false));
+        assert!(!rules.is_ignored(Path::new(".kube-backup/config"), false));
+        assert!(!rules.is_ignored(Path::new(".pytest_cache/v/x"), false));
+        assert!(!rules.is_ignored(Path::new("src/cache/mod.rs"), false));
+        assert!(!rules.is_ignored(Path::new("deploy/kube/app.yaml"), false));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn builtins_cannot_be_unignored() {
+        let root = setup_test_dir("ignore-builtin-whitelist");
+        fs::write(root.join(".gitignore"), "!.tsh/\n!*.beamup-tmp\n!.kube/\n").unwrap();
+        fs::write(root.join(".beamignore"), "!.tsh\n!.cache\n").unwrap();
+
+        let rules = IgnoreRules::load(&root);
+
+        assert!(rules.is_ignored(Path::new(".tsh/keys/x"), false));
+        assert!(rules.is_ignored(Path::new("file.beamup-tmp"), false));
+        assert!(rules.is_ignored(Path::new(".kube/config"), false));
+        assert!(rules.is_ignored(Path::new(".cache/x"), false));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn excludes_are_applied() {
+        let root = setup_test_dir("ignore-excludes");
+        let excludes = vec!["*.sqlite".to_string(), "/build/".to_string(), ".kube".to_string()];
+        let rules = IgnoreRules::with_excludes(&root, &excludes).unwrap();
+
+        assert!(rules.is_ignored(Path::new("app.sqlite"), false));
+        assert!(rules.is_ignored(Path::new("data/cache.sqlite"), false));
+        assert!(rules.is_ignored(Path::new("build"), true));
+        assert!(rules.is_ignored(Path::new("build/out.o"), false));
+        assert!(rules.is_ignored(Path::new(".kube/config"), false));
+        // Anchored: only the top-level build directory.
+        assert!(!rules.is_ignored(Path::new("src/build/mod.rs"), false));
+        assert!(!rules.is_ignored(Path::new("src/main.rs"), false));
+        // Built-ins still apply alongside them.
+        assert!(rules.is_ignored(Path::new(".tsh/keys/x"), false));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn excludes_cannot_be_unignored_by_files() {
+        let root = setup_test_dir("ignore-excludes-whitelist");
+        fs::write(root.join(".gitignore"), "!secrets/\n").unwrap();
+        let rules = IgnoreRules::with_excludes(&root, &["secrets/".to_string()]).unwrap();
+
+        assert!(rules.is_ignored(Path::new("secrets/token"), false));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn excludes_combine_with_ignore_files() {
+        let root = setup_test_dir("ignore-excludes-files");
+        fs::write(root.join(".gitignore"), "/target\n").unwrap();
+        fs::write(root.join(".beamignore"), "*.log\n").unwrap();
+        let rules = IgnoreRules::with_excludes(&root, &["*.csv".to_string()]).unwrap();
+
+        assert!(rules.is_ignored(Path::new("target/debug/app"), false));
+        assert!(rules.is_ignored(Path::new("run.log"), false));
+        assert!(rules.is_ignored(Path::new("results.csv"), false));
+        assert!(!rules.is_ignored(Path::new("src/lib.rs"), false));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn filter_path_applies_excludes() {
+        let root = setup_test_dir("ignore-excludes-filter-path");
+        let rules = IgnoreRules::with_excludes(&root, &["node_modules".to_string()]).unwrap();
+
+        assert!(rules.filter_path(&root, &root.join("web/node_modules/x/index.js"), false));
+        assert!(!rules.filter_path(&root, &root.join("web/src/index.js"), false));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejects_bad_excludes() {
+        let root = setup_test_dir("ignore-excludes-invalid");
+        for bad in ["", "   ", "!keep.txt", "# comment", "**/{a", "a[z-a]"] {
+            assert!(
+                IgnoreRules::with_excludes(&root, &[bad.to_string()]).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        // An escaped '#' is a real pattern.
+        assert!(IgnoreRules::with_excludes(&root, &["\\#notes".to_string()]).is_ok());
 
         let _ = fs::remove_dir_all(&root);
     }

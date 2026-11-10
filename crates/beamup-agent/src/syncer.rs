@@ -117,7 +117,6 @@ async fn run_session(
     watch_rx: &mut Option<mpsc::Receiver<WatchEvent>>,
     listener: Option<&UnixListener>,
 ) -> Result<SessionEnd> {
-    let ignore_rules = IgnoreRules::load(watch_dir);
     let mut file_states: HashMap<String, FileState> = HashMap::new();
     let mut suppress_set: HashMap<String, Instant> = HashMap::new();
     // Paths the CLI is pushing to us, from the SyncPlan or a FileChanged until its
@@ -126,25 +125,30 @@ async fn run_session(
     let mut incoming: HashSet<String> = HashSet::new();
 
     // Wait for Hello
-    let (initial_direction, ongoing_direction) = match transport.recv().await? {
+    let (initial_direction, ongoing_direction, ignore_rules) = match transport.recv().await? {
         Some(Message::Hello {
             version,
             session_id,
             initial_direction,
             ongoing_direction,
+            excludes,
         }) => {
             if version != PROTOCOL_VERSION {
                 anyhow::bail!(
                     "protocol version mismatch: got {version}, expected {PROTOCOL_VERSION}"
                 );
             }
+            // The CLI checks these before it gets this far, so a failure here
+            // means the two sides disagree about the syntax.
+            let ignore_rules = IgnoreRules::with_excludes(watch_dir, &excludes)
+                .context("client sent unusable exclude patterns")?;
             transport
                 .send(Message::HelloAck {
                     version: PROTOCOL_VERSION,
                 })
                 .await?;
-            info!("handshake complete, session: {session_id}, initial: {initial_direction:?}, ongoing: {ongoing_direction:?}");
-            (initial_direction, ongoing_direction)
+            info!("handshake complete, session: {session_id}, initial: {initial_direction:?}, ongoing: {ongoing_direction:?}, excludes: {excludes:?}");
+            (initial_direction, ongoing_direction, ignore_rules)
         }
         other => anyhow::bail!("expected Hello, got: {other:?}"),
     };
@@ -189,6 +193,7 @@ async fn run_session(
                             event,
                             &transport,
                             watch_dir,
+                            &ignore_rules,
                             &mut file_states,
                             &suppress_set,
                             &incoming,
@@ -624,10 +629,20 @@ async fn handle_watch_event(
     event: WatchEvent,
     transport: &Transport,
     watch_dir: &Path,
+    ignore_rules: &IgnoreRules,
     file_states: &mut HashMap<String, FileState>,
     suppress_set: &HashMap<String, Instant>,
     incoming: &HashSet<String>,
 ) -> Result<()> {
+    // The watcher thread only knows the base rules: a persistent agent starts it
+    // before any client, and so before any client's --exclude patterns.
+    let (path, is_dir) = match &event {
+        WatchEvent::Modified(p) | WatchEvent::Deleted(p) => (p, false),
+        WatchEvent::DirCreated(p) | WatchEvent::DirDeleted(p) => (p, true),
+    };
+    if ignore_rules.is_ignored(Path::new(path), is_dir) {
+        return Ok(());
+    }
     match event {
         WatchEvent::Modified(path) => {
             if suppress_set.contains_key(&path) || incoming.contains(&path) {
@@ -776,11 +791,16 @@ mod tests {
     }
 
     async fn hello(conn: &mut Framed<UnixStream, MessageCodec>, session_id: &str) {
+        hello_with(conn, session_id, vec![]).await
+    }
+
+    async fn hello_with(conn: &mut Framed<UnixStream, MessageCodec>, session_id: &str, excludes: Vec<String>) {
         conn.send(Message::Hello {
             version: PROTOCOL_VERSION,
             session_id: session_id.into(),
             initial_direction: SyncDirection::Bidirectional,
             ongoing_direction: SyncDirection::LocalToBeam,
+            excludes,
         })
         .await
         .unwrap();
@@ -826,6 +846,7 @@ mod tests {
             session_id: "push".into(),
             initial_direction: SyncDirection::Bidirectional,
             ongoing_direction: SyncDirection::Bidirectional,
+            excludes: vec![],
         })
         .await
         .unwrap();
@@ -889,6 +910,174 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn manifest_paths(entries: &[ManifestEntry]) -> Vec<&str> {
+        let mut paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        paths.sort();
+        paths
+    }
+
+    /// A beam's home directory: a project, its tsh profile and kubeconfig, a cache,
+    /// and some build output.
+    fn home_like(name: &str) -> PathBuf {
+        let dir = temp_dir(name);
+        std::fs::create_dir_all(dir.join(".tsh/keys/odd-firefly.beams.sh")).unwrap();
+        std::fs::write(dir.join(".tsh/keys/odd-firefly.beams.sh/bot-beam-x-x509.pem"), b"cert").unwrap();
+        std::fs::write(dir.join(".tsh/odd-firefly.beams.sh.yaml"), b"profile").unwrap();
+        std::fs::create_dir_all(dir.join(".kube")).unwrap();
+        std::fs::write(dir.join(".kube/config"), b"kubeconfig").unwrap();
+        std::fs::create_dir_all(dir.join(".cache/pip")).unwrap();
+        std::fs::write(dir.join(".cache/pip/wheel"), b"wheel").unwrap();
+        std::fs::create_dir_all(dir.join("project/build")).unwrap();
+        std::fs::write(dir.join("project/main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(dir.join("project/build/out.o"), b"obj").unwrap();
+        std::fs::write(dir.join("notes.log"), b"log").unwrap();
+        dir
+    }
+
+    #[test]
+    fn manifest_leaves_out_tsh_kube_and_cache() {
+        let dir = home_like("manifest-tsh");
+        let rules = IgnoreRules::load(&dir);
+        let entries = build_manifest(&dir, &rules, &mut HashCache::default()).unwrap();
+
+        assert_eq!(
+            manifest_paths(&entries),
+            vec!["notes.log", "project", "project/build", "project/build/out.o", "project/main.rs"]
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manifest_leaves_out_excludes() {
+        let dir = home_like("manifest-excludes");
+        let excludes = vec!["build/".to_string(), "*.log".to_string()];
+        let rules = IgnoreRules::with_excludes(&dir, &excludes).unwrap();
+        let entries = build_manifest(&dir, &rules, &mut HashCache::default()).unwrap();
+
+        assert_eq!(manifest_paths(&entries), vec!["project", "project/main.rs"]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Excludes arrive in Hello: the agent must not offer excluded files for pulling,
+    /// and must still leave out ~/.tsh, ~/.kube and ~/.cache with none given.
+    #[tokio::test]
+    async fn session_applies_excludes_from_hello() {
+        let dir = temp_dir("session-excludes");
+        let watch_dir = home_like("session-excludes-home");
+        let socket = dir.join("agent.sock");
+        tokio::spawn(listen(watch_dir.clone(), socket.clone()));
+
+        let connect = || async {
+            for _ in 0..50 {
+                if let Ok(s) = UnixStream::connect(&socket).await {
+                    return Framed::new(s, MessageCodec);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("agent never started listening");
+        };
+        async fn plan_pulls(conn: &mut Framed<UnixStream, MessageCodec>) -> Vec<String> {
+            conn.send(Message::FileManifest { entries: vec![] }).await.unwrap();
+            match conn.next().await {
+                Some(Ok(Message::SyncPlan { to_pull, .. })) => {
+                    let mut paths: Vec<String> = to_pull.into_iter().map(|e| e.path).collect();
+                    paths.sort();
+                    paths
+                }
+                other => panic!("expected SyncPlan, got {other:?}"),
+            }
+        }
+
+        let mut conn = connect().await;
+        hello_with(&mut conn, "excludes", vec!["build/".into(), "*.log".into()]).await;
+        assert_eq!(plan_pulls(&mut conn).await, vec!["project/main.rs"]);
+
+        // Excludes belong to the session: the next client on the same agent sends none.
+        let mut conn = connect().await;
+        hello(&mut conn, "none").await;
+        assert_eq!(
+            plan_pulls(&mut conn).await,
+            vec!["notes.log", "project/build/out.o", "project/main.rs"]
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&watch_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_rejects_unusable_excludes() {
+        let dir = temp_dir("session-bad-excludes");
+        let watch_dir = dir.join("sync");
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
+        let (reader, writer) = server.into_split();
+        let session = tokio::spawn({
+            let watch_dir = watch_dir.clone();
+            async move {
+                let mut cache = HashCache::default();
+                let mut watch_rx = None;
+                run_session(Transport::new(reader, writer), &watch_dir, &mut cache, &mut watch_rx, None).await
+            }
+        });
+
+        let mut conn = Framed::new(client, MessageCodec);
+        conn.send(Message::Hello {
+            version: PROTOCOL_VERSION,
+            session_id: "bad".into(),
+            initial_direction: SyncDirection::Bidirectional,
+            ongoing_direction: SyncDirection::LocalToBeam,
+            excludes: vec!["a[z-a]".into()],
+        })
+        .await
+        .unwrap();
+
+        let err = match session.await.unwrap() {
+            Ok(_) => panic!("session accepted an invalid exclude pattern"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("exclude"), "unexpected error: {err:#}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The watcher thread runs with base rules only, so --exclude has to be applied
+    /// to its events. Built-ins and excludes alike must never reach the CLI.
+    #[tokio::test]
+    async fn watch_events_for_ignored_paths_are_dropped() {
+        let watch_dir = home_like("watch-excludes");
+        let rules = IgnoreRules::with_excludes(&watch_dir, &["build/".to_string()]).unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
+        let (reader, writer) = server.into_split();
+        let transport = Transport::new(reader, writer);
+        let mut conn = Framed::new(client, MessageCodec);
+        let mut file_states = HashMap::new();
+        let suppress = HashMap::new();
+        let incoming = HashSet::new();
+
+        for event in [
+            WatchEvent::Modified("project/build/out.o".into()),
+            WatchEvent::Deleted("project/build/out.o".into()),
+            WatchEvent::DirCreated("project/build".into()),
+            WatchEvent::DirDeleted("project/build".into()),
+            WatchEvent::Modified(".tsh/odd-firefly.beams.sh.yaml".into()),
+            WatchEvent::DirCreated(".tsh/keys".into()),
+            // Not ignored: this one, and only this one, must come through.
+            WatchEvent::Modified("project/main.rs".into()),
+        ] {
+            handle_watch_event(event, &transport, &watch_dir, &rules, &mut file_states, &suppress, &incoming)
+                .await
+                .unwrap();
+        }
+
+        let sent = drain(&mut conn, Duration::from_millis(300)).await;
+        assert_eq!(sent.len(), 1, "expected only project/main.rs, got {sent:?}");
+        assert!(mentions(&sent[0], "project/main.rs"), "unexpected message: {:?}", sent[0]);
+
+        std::fs::remove_dir_all(&watch_dir).unwrap();
     }
 
     #[tokio::test]

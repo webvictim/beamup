@@ -85,9 +85,9 @@ binaries, and publishes the release.
 
 ## Protocol
 
-Protocol version 3. Messages are msgpack-encoded, length-prefixed (4-byte big-endian). Key message flow:
+Protocol version 4. Messages are msgpack-encoded, length-prefixed (4-byte big-endian). Key message flow:
 
-1. CLI sends `Hello` (with sync directions) → Agent replies `HelloAck`
+1. CLI sends `Hello` (with sync directions and `--exclude` patterns) → Agent replies `HelloAck`
 2. CLI sends `FileManifest` → Agent replies `SyncPlan` (what to push/pull)
 3. Transfers happen (tar batches for small files, chunked SCP for large)
 4. Both sides exchange `ManifestAck`
@@ -99,6 +99,8 @@ Protocol version 3. Messages are msgpack-encoded, length-prefixed (4-byte big-en
 - Temp files use `.beamup-tmp` extension (auto-ignored by sync)
 - Large files (>chunk_size, default 64MB) are split, lz4-compressed per-chunk, transferred in parallel
 - `.git/index` and `.git/index.lock` are never synced (platform-specific)
+- `.tsh/`, `.kube/` and `.cache/` are never synced. A tsh profile only works with the private key held by its own beam's tbot, so a copied one breaks every Beam command with `tls: error decrypting message`; a kubeconfig points at that profile; caches are big and platform-specific. Built-ins live in `BUILTIN_PATTERNS` in `ignore.rs` and are checked before `--exclude`, `.gitignore` and `.beamignore`, so `!` can't undo them
+- `--exclude` patterns travel to the agent in `Hello`, and both sides build `IgnoreRules::with_excludes` from them. The agent's watcher thread only has the base rules (a persistent agent starts it before any client), so `handle_watch_event` filters its events against the session's rules
 - All `tsh` invocations go through `beam::tsh_command()` / `beam::tsh_command_sync()` helpers (prepend `-i` and `--proxy` when configured)
 - SCP and exec operations retry up to 3 times with exponential backoff on failure
 - `--oneshot` mode: handshake + initial sync only, then exit (no watcher, no ongoing loop); a persistent agent stays running

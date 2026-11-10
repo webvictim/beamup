@@ -104,3 +104,28 @@ async fn main() -> Result<()> {
         Commands::Exec(args) => commands::exec::run(args).await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn excludes(argv: &[&str]) -> Vec<String> {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Commands::Start(args) => args.exclude,
+            Commands::Sync(args) => args.exclude,
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn exclude_is_repeatable_on_start_and_sync() {
+        for cmd in ["start", "sync"] {
+            assert_eq!(
+                excludes(&["beamup", cmd, "--exclude", "*.sqlite", "--exclude=build/"]),
+                vec!["*.sqlite", "build/"],
+                "beamup {cmd}"
+            );
+            assert!(excludes(&["beamup", cmd]).is_empty(), "beamup {cmd}");
+        }
+    }
+}

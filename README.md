@@ -168,7 +168,7 @@ Common patterns:
 - **Console mode** — `--console` drops you into a beam shell after sync completes
 - **Near-realtime** — sub-second propagation via OS-native file watching
 - **Conflict detection** — when both sides edit the same file, both versions are preserved (`.local.conflict` suffix) and the user is alerted
-- **Respects .gitignore** — plus an optional `.beamignore` for additional exclusions
+- **Respects .gitignore** — plus an optional `.beamignore` and `--exclude <pattern>` for additional exclusions. `.tsh`, `.kube` and `.cache` directories are never synced
 - **Atomic writes** — write-to-temp-then-rename prevents partial file corruption
 - **Heartbeat monitoring** — detects beam death within 15 seconds
 - **Large file chunking** — files over 64MB are split into chunks, compressed, and transferred in parallel

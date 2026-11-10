@@ -84,13 +84,15 @@ mod tests {
             session_id: "abc123".to_string(),
             initial_direction: SyncDirection::LocalToBeam,
             ongoing_direction: SyncDirection::BeamToLocal,
+            excludes: vec!["*.log".to_string(), ".kube/".to_string()],
         };
         match round_trip(msg) {
-            Message::Hello { version, session_id, initial_direction, ongoing_direction } => {
+            Message::Hello { version, session_id, initial_direction, ongoing_direction, excludes } => {
                 assert_eq!(version, 3);
                 assert_eq!(session_id, "abc123");
                 assert_eq!(initial_direction, SyncDirection::LocalToBeam);
                 assert_eq!(ongoing_direction, SyncDirection::BeamToLocal);
+                assert_eq!(excludes, vec!["*.log".to_string(), ".kube/".to_string()]);
             }
             other => panic!("unexpected: {other:?}"),
         }

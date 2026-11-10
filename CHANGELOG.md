@@ -8,6 +8,15 @@ call out when more than that is needed.
 
 ## [v0.2.1] — 2026-11-10
 
+### Added
+
+- **`--exclude` works, on both `start` and `sync`.** It was accepted by
+  `start` but never used. It now takes gitignore-style patterns, relative to
+  the synced directory, and can be repeated. The beam leaves the same paths
+  out too. `start` rejects empty patterns, ones starting with `!` or `#`, and
+  invalid globs before creating a beam. `sync` without `--exclude` reuses the
+  patterns from the previous session for the same beam and directories.
+
 ### Changed
 
 - **A relative `--remote-path` is now under `/home/beams`.** `--remote-path git`
@@ -18,6 +27,17 @@ call out when more than that is needed.
 
 ### Fixed
 
+- **`.tsh`, `.kube` and `.cache` directories are never synced.** Syncing a
+  beam's home directory to your machine and then into another beam carried
+  `~/.tsh` across. In the second beam, every Beam command then failed with
+  `remote error: tls: error decrypting message`, as did every beam started
+  from a Phase snapshot taken there. A synced `.kube` left the other side with
+  the wrong cluster credentials, and could overwrite your machine's
+  `~/.kube/config`. This release stops them being copied, but copies already
+  made, including those baked into Phase snapshots, stay where they are.
+- **`.gitignore` and `.beamignore` can no longer re-include built-in
+  exclusions.** A `!` line used to be able to bring back the temp-file and
+  `.git/index` rules, and now the directories above.
 - **`~` in `--local-path` and `--remote-path` now works when your shell
   doesn't expand it.** Neither path passes through a shell after you type it,
   so a quoted `'~/project'`, or `--local-path=~/project` (which shells leave

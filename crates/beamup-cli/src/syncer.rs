@@ -348,7 +348,7 @@ impl SyncEngine {
                 let paths: Vec<String> = tar_files.iter().map(|e| e.path.clone()).collect();
                 let sizes: Vec<u64> = tar_files.iter().map(|e| e.size).collect();
                 let tar_total: u64 = sizes.iter().sum();
-                let results = self.transfer_pool.push_batch_tar(paths, sizes).await;
+                let results = self.transfer_pool.push_batch_tar(paths, sizes, pb.clone()).await;
                 total_bytes += tar_total;
                 let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
                 if !failures.is_empty() {
@@ -357,7 +357,6 @@ impl SyncEngine {
 
                 files_done += tar_files.len();
                 if let Some(ref pb) = pb {
-                    pb.inc(tar_total);
                     pb.set_message(format!("{files_done}/{total_files} files"));
                 }
 
@@ -438,7 +437,7 @@ impl SyncEngine {
                 let paths: Vec<String> = tar_files.iter().map(|e| e.path.clone()).collect();
                 let sizes: Vec<u64> = tar_files.iter().map(|e| e.size).collect();
                 let pull_total: u64 = sizes.iter().sum();
-                let results = self.transfer_pool.pull_batch_tar(paths, sizes).await;
+                let results = self.transfer_pool.pull_batch_tar(paths, sizes, pb.clone()).await;
                 total_bytes += pull_total;
                 let failures: Vec<_> = results.iter().filter(|r| !r.success).collect();
                 if !failures.is_empty() {
@@ -447,7 +446,6 @@ impl SyncEngine {
 
                 files_done += tar_files.len();
                 if let Some(ref pb) = pb {
-                    pb.inc(pull_total);
                     pb.set_message(format!("{files_done}/{total_files} files"));
                 }
             }

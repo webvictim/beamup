@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use beamup_protocol::compress;
+use indicatif::ProgressBar;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -152,7 +154,13 @@ impl TransferPool {
 
     /// Push files via tar streaming through tsh beams exec pipes.
     /// Files are grouped into batches (~256MB each) and transferred in parallel.
-    pub async fn push_batch_tar(&self, paths: Vec<String>, sizes: Vec<u64>) -> Vec<TransferResult> {
+    /// `pb`, if given, advances as each batch's bytes move through its pipe.
+    pub async fn push_batch_tar(
+        &self,
+        paths: Vec<String>,
+        sizes: Vec<u64>,
+        pb: Option<ProgressBar>,
+    ) -> Vec<TransferResult> {
         let batches = make_batches(paths, sizes);
         let num_batches = batches.len();
         debug!("tar push: {num_batches} batches");
@@ -163,6 +171,7 @@ impl TransferPool {
             let beam_id = self.beam_id.clone();
             let local_dir = self.local_dir.clone();
             let remote_dir = self.remote_dir.clone();
+            let progress = BatchProgress::new(pb.clone(), batch.total_bytes);
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
@@ -171,15 +180,21 @@ impl TransferPool {
                 let batch_bytes = batch.total_bytes;
                 info!("tar push batch {batch_idx}: {} files, {} bytes", batch_paths.len(), batch_bytes);
 
-                let mut result = tar_push_batch(&beam_id, &local_dir, &remote_dir, &batch.paths).await;
+                let mut result = tar_push_batch(&beam_id, &local_dir, &remote_dir, &batch.paths, progress.clone()).await;
                 for retry in 1..=3u32 {
                     if result.is_ok() {
                         break;
                     }
+                    progress.rewind();
                     let backoff = std::time::Duration::from_secs(1) * 2u32.pow(retry - 1);
                     warn!("tar push batch {batch_idx} retry {retry}/3 (backoff {backoff:?})");
                     tokio::time::sleep(backoff).await;
-                    result = tar_push_batch(&beam_id, &local_dir, &remote_dir, &batch.paths).await;
+                    result = tar_push_batch(&beam_id, &local_dir, &remote_dir, &batch.paths, progress.clone()).await;
+                }
+                if result.is_ok() {
+                    progress.complete();
+                } else {
+                    progress.rewind();
                 }
                 let duration = start.elapsed();
 
@@ -229,7 +244,13 @@ impl TransferPool {
 
     /// Pull files via tar streaming through tsh beams exec pipes.
     /// Files are grouped into batches (~256MB each) and transferred in parallel.
-    pub async fn pull_batch_tar(&self, paths: Vec<String>, sizes: Vec<u64>) -> Vec<TransferResult> {
+    /// `pb`, if given, advances as each batch's bytes move through its pipe.
+    pub async fn pull_batch_tar(
+        &self,
+        paths: Vec<String>,
+        sizes: Vec<u64>,
+        pb: Option<ProgressBar>,
+    ) -> Vec<TransferResult> {
         let batches = make_batches(paths, sizes);
         let num_batches = batches.len();
         debug!("tar pull: {num_batches} batches");
@@ -240,6 +261,7 @@ impl TransferPool {
             let beam_id = self.beam_id.clone();
             let local_dir = self.local_dir.clone();
             let remote_dir = self.remote_dir.clone();
+            let progress = BatchProgress::new(pb.clone(), batch.total_bytes);
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
@@ -248,15 +270,21 @@ impl TransferPool {
                 let batch_bytes = batch.total_bytes;
                 debug!("tar pull batch {batch_idx}: {} files, {} bytes", batch_paths.len(), batch_bytes);
 
-                let mut result = tar_pull_batch(&beam_id, &local_dir, &remote_dir, &batch.paths).await;
+                let mut result = tar_pull_batch(&beam_id, &local_dir, &remote_dir, &batch.paths, progress.clone()).await;
                 for retry in 1..=3u32 {
                     if result.is_ok() {
                         break;
                     }
+                    progress.rewind();
                     let backoff = std::time::Duration::from_secs(1) * 2u32.pow(retry - 1);
                     warn!("tar pull batch {batch_idx} retry {retry}/3 (backoff {backoff:?})");
                     tokio::time::sleep(backoff).await;
-                    result = tar_pull_batch(&beam_id, &local_dir, &remote_dir, &batch.paths).await;
+                    result = tar_pull_batch(&beam_id, &local_dir, &remote_dir, &batch.paths, progress.clone()).await;
+                }
+                if result.is_ok() {
+                    progress.complete();
+                } else {
+                    progress.rewind();
                 }
                 let duration = start.elapsed();
 
@@ -309,6 +337,73 @@ fn file_id(path: &str) -> String {
     format!("{:x}", beamup_protocol::hash::hash_content(path.as_bytes()))
 }
 
+/// Moves the progress bar as a tar batch's bytes go through its pipe, so a
+/// slow link shows steady progress rather than a jump when the batch ends.
+/// Credit is capped at the batch's file bytes (a pulled tar stream also
+/// carries headers), and `rewind` takes back a failed attempt's credit before
+/// a retry so the same bytes are never counted twice.
+#[derive(Clone)]
+struct BatchProgress {
+    pb: Option<ProgressBar>,
+    total: u64,
+    credited: Arc<AtomicU64>,
+}
+
+impl BatchProgress {
+    fn new(pb: Option<ProgressBar>, total: u64) -> Self {
+        Self { pb, total, credited: Arc::new(AtomicU64::new(0)) }
+    }
+
+    fn add(&self, n: u64) {
+        let Some(pb) = &self.pb else { return };
+        // A compare-exchange loop rather than fetch_update, which newer
+        // toolchains deprecate in favour of a try_update older ones lack.
+        let mut prev = self.credited.load(Ordering::Relaxed);
+        loop {
+            let next = prev.saturating_add(n).min(self.total);
+            if next == prev {
+                return;
+            }
+            match self.credited.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    pb.inc(next - prev);
+                    return;
+                }
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    /// Credit whatever the stream didn't (e.g. files skipped as missing).
+    fn complete(&self) {
+        self.add(self.total);
+    }
+
+    fn rewind(&self) {
+        let Some(pb) = &self.pb else { return };
+        let prev = self.credited.swap(0, Ordering::Relaxed);
+        // dec, not set_position(position() - prev): batches share the bar,
+        // and another batch's inc between the read and the write would be
+        // lost. The bar only ever gains through inc, so its position is at
+        // least this batch's credit and dec can't wrap.
+        pb.dec(prev);
+    }
+}
+
+/// Reports every byte read through it to a batch's progress.
+struct CountingReader<R> {
+    inner: R,
+    progress: BatchProgress,
+}
+
+impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.progress.add(n as u64);
+        Ok(n)
+    }
+}
+
 const TAR_BATCH_SIZE: u64 = 256 * 1024 * 1024; // 256MB per batch
 
 struct Batch {
@@ -334,12 +429,34 @@ fn make_batches(paths: Vec<String>, sizes: Vec<u64>) -> Vec<Batch> {
     batches
 }
 
+/// A tar entry for `file` whose data is read through a counter, so the bar
+/// moves as the file streams; `Builder::append_data` adds it. This is what
+/// `append_file` does — the same GNU header, from the same metadata, with
+/// long paths handled by `append_data` — except that a sparse file is sent
+/// in full rather than as sparse entries, which unpacks to the same file.
+/// `take()` keeps a file that grows mid-read from overrunning the size in
+/// its header.
+fn counted_entry(
+    file: std::fs::File,
+    progress: &BatchProgress,
+) -> std::io::Result<(tar::Header, CountingReader<std::io::Take<std::fs::File>>, u64)> {
+    use std::io::Read;
+
+    let metadata = file.metadata()?;
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(&metadata);
+    let len = metadata.len();
+    let reader = CountingReader { inner: file.take(len), progress: progress.clone() };
+    Ok((header, reader, len))
+}
+
 /// Push a batch of files to the beam by streaming a tar archive through tsh beams exec.
 async fn tar_push_batch(
     beam_id: &str,
     local_dir: &Path,
     remote_dir: &str,
     paths: &[String],
+    progress: BatchProgress,
 ) -> Result<u64> {
     use std::process::Stdio;
 
@@ -362,18 +479,16 @@ async fn tar_push_batch(
         let mut builder = tar::Builder::new(stdin);
         for rel_path in &paths {
             let full_path = local_dir.join(rel_path);
-            if !full_path.exists() {
+            let Ok(file) = std::fs::File::open(&full_path) else {
                 skipped += 1;
                 continue;
-            }
-            if let Ok(metadata) = full_path.metadata() {
-                bytes_written += metadata.len();
-            }
-            let mut file = match std::fs::File::open(&full_path) {
-                Ok(f) => f,
-                Err(_) => { skipped += 1; continue; }
             };
-            if let Err(e) = builder.append_file(rel_path, &mut file) {
+            let Ok((mut header, reader, len)) = counted_entry(file, &progress) else {
+                skipped += 1;
+                continue;
+            };
+            bytes_written += len;
+            if let Err(e) = builder.append_data(&mut header, rel_path, reader) {
                 // If the pipe broke (remote tar died), bail out
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
                     drop(builder);
@@ -406,6 +521,7 @@ async fn tar_pull_batch(
     local_dir: &Path,
     remote_dir: &str,
     paths: &[String],
+    progress: BatchProgress,
 ) -> Result<u64> {
     use std::io::{Read, Write};
     use std::process::Stdio;
@@ -431,9 +547,9 @@ async fn tar_pull_batch(
         drop(stdin);
 
         // Read tar from stdout
-        let mut stdout = child.stdout.take().expect("stdout not captured");
+        let stdout = child.stdout.take().expect("stdout not captured");
         let mut tar_data = Vec::new();
-        stdout.read_to_end(&mut tar_data)?;
+        CountingReader { inner: stdout, progress }.read_to_end(&mut tar_data)?;
 
         let status = child.wait()?;
         if !status.success() {
@@ -671,4 +787,167 @@ pub async fn upload_agent(beam_id: &str, agent_path: &Path, remote_path: &str) -
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn bar(len: u64) -> ProgressBar {
+        let pb = ProgressBar::hidden();
+        pb.set_length(len);
+        pb
+    }
+
+    #[test]
+    fn credit_is_capped_at_the_batch_total() {
+        let pb = bar(100);
+        let p = BatchProgress::new(Some(pb.clone()), 100);
+        p.add(60);
+        p.add(60); // a pulled stream's tar headers push past the file bytes
+        assert_eq!(pb.position(), 100);
+        p.add(1);
+        assert_eq!(pb.position(), 100);
+    }
+
+    #[test]
+    fn rewind_takes_back_only_this_batchs_credit() {
+        let pb = bar(200);
+        let a = BatchProgress::new(Some(pb.clone()), 100);
+        let b = BatchProgress::new(Some(pb.clone()), 100);
+        a.add(30);
+        b.add(50);
+        a.rewind();
+        assert_eq!(pb.position(), 50, "b's bytes stay counted");
+        a.add(10); // the retry starts from nothing
+        assert_eq!(pb.position(), 60);
+        a.rewind();
+        a.rewind(); // nothing left to take back
+        assert_eq!(pb.position(), 50);
+    }
+
+    #[test]
+    fn complete_tops_up_the_remainder_once() {
+        let pb = bar(100);
+        let p = BatchProgress::new(Some(pb.clone()), 100);
+        p.add(40);
+        p.complete();
+        assert_eq!(pb.position(), 100);
+        p.complete();
+        assert_eq!(pb.position(), 100);
+    }
+
+    #[test]
+    fn concurrent_credit_never_exceeds_the_total() {
+        let pb = bar(10_000);
+        let p = BatchProgress::new(Some(pb.clone()), 10_000);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let p = p.clone();
+                s.spawn(move || (0..5_000).for_each(|_| p.add(1)));
+            }
+        });
+        assert_eq!(pb.position(), 10_000);
+        assert_eq!(p.credited.load(Ordering::Relaxed), 10_000);
+    }
+
+    #[test]
+    fn without_a_bar_it_does_nothing() {
+        let p = BatchProgress::new(None, 100);
+        p.add(50);
+        p.complete();
+        p.rewind();
+        assert_eq!(p.credited.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn counting_reader_reports_every_byte() {
+        let pb = bar(1 << 20);
+        let p = BatchProgress::new(Some(pb.clone()), 1 << 20);
+        let data = vec![7u8; 300_000];
+        let mut out = Vec::new();
+        CountingReader { inner: &data[..], progress: p }.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data);
+        assert_eq!(pb.position(), 300_000);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("beamup-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn archive(src: &Path, paths: &[&str], counted: Option<&BatchProgress>) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for rel in paths {
+            let file = std::fs::File::open(src.join(rel)).unwrap();
+            match counted {
+                Some(progress) => {
+                    let (mut header, reader, _) = counted_entry(file, progress).unwrap();
+                    builder.append_data(&mut header, rel, reader).unwrap();
+                }
+                None => builder.append_file(rel, &mut { file }).unwrap(),
+            }
+        }
+        builder.into_inner().unwrap()
+    }
+
+    /// The counted push path has to build the archive append_file did:
+    /// same entries, same headers, same contents, long paths included.
+    #[test]
+    fn counted_entries_match_append_file() {
+        let src = scratch("tar-src");
+        let long = format!("{}/{}.bin", "deep-directory-name".repeat(6), "f".repeat(120));
+        let files: Vec<(String, Vec<u8>)> = vec![
+            ("small.txt".into(), b"hello\n".to_vec()),
+            ("empty".into(), Vec::new()),
+            ("nested/dir/blocky.bin".into(), (0..2048u32).map(|i| (i * 31 % 251) as u8).collect()),
+            ("odd-size.bin".into(), vec![0xAB; 513]),
+            (long.clone(), b"long path".to_vec()),
+        ];
+        for (rel, data) in &files {
+            let path = src.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, data).unwrap();
+        }
+        let rels: Vec<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
+        let total: u64 = files.iter().map(|(_, d)| d.len() as u64).sum();
+
+        let pb = bar(total);
+        let progress = BatchProgress::new(Some(pb.clone()), total);
+        let counted = archive(&src, &rels, Some(&progress));
+        let plain = archive(&src, &rels, None);
+        assert_eq!(pb.position(), total, "every file byte was counted as it streamed");
+
+        // Entry by entry: path, header fields and data agree.
+        let entries = |bytes: &[u8]| -> Vec<(PathBuf, u64, u32, u64, u8, Vec<u8>)> {
+            let mut ar = tar::Archive::new(bytes);
+            ar.entries()
+                .unwrap()
+                .map(|e| {
+                    let mut e = e.unwrap();
+                    let h = e.header().clone();
+                    let mut data = Vec::new();
+                    e.read_to_end(&mut data).unwrap();
+                    let path = e.path().unwrap().into_owned();
+                    (path, h.size().unwrap(), h.mode().unwrap(), h.mtime().unwrap(), h.entry_type().as_byte(), data)
+                })
+                .collect()
+        };
+        let got = entries(&counted);
+        assert_eq!(got, entries(&plain));
+        assert_eq!(got.len(), files.len());
+        assert!(got.iter().any(|e| e.0 == Path::new(&long)), "long path survived");
+
+        // And it unpacks to identical files.
+        let dst = scratch("tar-dst");
+        tar::Archive::new(&counted[..]).unpack(&dst).unwrap();
+        for (rel, data) in &files {
+            assert_eq!(&std::fs::read(dst.join(rel)).unwrap(), data, "{rel}");
+        }
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
 }

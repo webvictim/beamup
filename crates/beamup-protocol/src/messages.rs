@@ -22,6 +22,16 @@ impl SyncDirection {
     pub fn should_pull(&self) -> bool {
         matches!(self, SyncDirection::BeamToLocal | SyncDirection::Bidirectional)
     }
+
+    /// The arrow between local (on the left) and beam (on the right) that
+    /// shows which way changes flow.
+    pub fn arrow(&self) -> &'static str {
+        match self {
+            SyncDirection::LocalToBeam => "→",
+            SyncDirection::BeamToLocal => "←",
+            SyncDirection::Bidirectional => "↔",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

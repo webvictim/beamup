@@ -112,7 +112,11 @@ pub async fn run(args: StartArgs, log_file: Option<PathBuf>) -> Result<()> {
 
     let chunk_size_bytes = args.chunk_size * 1024 * 1024;
 
-    info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, remote_dir);
+    let ongoing = (!args.oneshot).then(|| args.ongoing_sync.into());
+    info!(
+        "starting sync: {}",
+        super::describe_sync(&local_dir, &beam_id, &remote_dir, args.initial_sync.into(), ongoing)
+    );
 
     let mut engine = SyncEngine::new(
         beam_id.clone(),

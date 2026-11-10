@@ -6,6 +6,29 @@ Each version links to its full commit range. Upgrading is just replacing the
 `beamup` binary: it deploys the matching agent to the beam itself. Entries
 call out when more than that is needed.
 
+## [v0.2.1] — 2026-11-10
+
+### Changed
+
+- **A relative `--remote-path` is now under `/home/beams`.** `--remote-path git`
+  syncs to `/home/beams/git`. Previously a relative path resolved against the
+  agent's working directory, which isn't guaranteed to be the beam's home. If
+  you passed a relative path that worked, it most likely still points to the
+  same place. Absolute paths are unchanged.
+
+### Fixed
+
+- **`~` in `--local-path` and `--remote-path` now works when your shell
+  doesn't expand it.** Neither path passes through a shell after you type it,
+  so a quoted `'~/project'`, or `--local-path=~/project` (which shells leave
+  alone), was taken literally. Locally that failed with a bare "No such file
+  or directory"; on the beam it created a directory actually named `~`. A
+  local `~` now expands to your home directory, and a remote `~` to
+  `/home/beams`. `~otheruser` is rejected with an error asking for an absolute
+  path, rather than syncing to the wrong place.
+- **Path errors name the path.** When `--local-path` can't be resolved, or the
+  agent can't create its remote directory, the error now says which path.
+
 ## [v0.2.0] — 2026-10-06
 
 ### Added
@@ -133,6 +156,7 @@ direct IP needed. It deploys a small agent to the beam, embedded in the
 
 - Only aarch64 beams are supported. Fixed in v0.1.2.
 
+[v0.2.1]: https://github.com/webvictim/beamup/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/webvictim/beamup/compare/v0.1.2...v0.2.0
 [v0.1.2]: https://github.com/webvictim/beamup/compare/v0.1.1...v0.1.2
 [v0.1.1]: https://github.com/webvictim/beamup/compare/v0.1.0...v0.1.1

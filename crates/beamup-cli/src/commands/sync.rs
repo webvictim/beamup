@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 use tracing::info;
 
 use crate::beam::Beam;
 use crate::commands::CliSyncDirection;
 use crate::config::Session;
+use crate::paths;
 use crate::syncer::SyncEngine;
 
 #[derive(Args)]
@@ -19,7 +20,8 @@ pub struct SyncArgs {
     #[arg(long)]
     pub local_path: Option<PathBuf>,
 
-    /// Remote directory to sync into
+    /// Remote directory to sync into (`~` and relative paths resolve against
+    /// the beam's home directory)
     #[arg(long, default_value = "/home/beams/sync")]
     pub remote_path: String,
 
@@ -58,7 +60,11 @@ pub async fn run(args: SyncArgs) -> Result<()> {
     let local_dir = args
         .local_path
         .unwrap_or_else(|| std::env::current_dir().expect("cannot get current directory"));
-    let local_dir = local_dir.canonicalize()?;
+    let local_dir = paths::expand_local(&local_dir)?;
+    let local_dir = local_dir
+        .canonicalize()
+        .with_context(|| format!("cannot resolve --local-path {}", local_dir.display()))?;
+    let remote_dir = paths::expand_remote(&args.remote_path)?;
 
     // Verify beam exists
     let beams = Beam::list().await?;
@@ -68,23 +74,23 @@ pub async fn run(args: SyncArgs) -> Result<()> {
 
     // Deploy agent (in case it's not running)
     info!("deploying agent...");
-    let agent_mode = Beam::deploy_agent(&beam_id, &args.remote_path).await?;
+    let agent_mode = Beam::deploy_agent(&beam_id, &remote_dir).await?;
 
     let session = Session {
         beam_id: beam_id.clone(),
         local_dir: local_dir.clone(),
-        remote_dir: args.remote_path.clone(),
+        remote_dir: remote_dir.clone(),
         agent_service: agent_mode.service_name().map(str::to_string),
     };
     session.save()?;
 
-    info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, args.remote_path);
+    info!("starting sync: {} ↔ {}:{}", local_dir.display(), beam_id, remote_dir);
 
     let chunk_size_bytes = args.chunk_size * 1024 * 1024;
     let mut engine = SyncEngine::new(
         beam_id.clone(),
         local_dir,
-        args.remote_path,
+        remote_dir,
         args.concurrency,
         chunk_size_bytes,
         args.initial_sync.into(),

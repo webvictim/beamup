@@ -145,7 +145,9 @@ beamup respects `.gitignore` and an optional `.beamignore` file (same syntax). A
 
 ## Remote directory
 
-Files sync to `/home/beams/sync` on the beam by default (override with `--remote-path`). Connect to the beam with:
+Files sync to `/home/beams/sync` on the beam by default (override with `--remote-path`). `--remote-path` is resolved on the beam, not locally: `~/git` and `git` both mean `/home/beams/git`. Quote it (`--remote-path '~/git'`) so your own shell doesn't expand the `~` against your *local* home first. `~otheruser` is rejected — use an absolute path.
+
+Connect to the beam with:
 
 ```bash
 tsh beams console <beam-name>

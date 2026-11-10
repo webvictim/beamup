@@ -7,7 +7,7 @@ mod watcher;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use beamup_protocol::compress;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -152,7 +152,9 @@ async fn main() -> Result<()> {
         anyhow::bail!("agent must be run with --serve, --connect, --decompress, --compress, or --decompress-chunks");
     }
 
-    std::fs::create_dir_all(&args.watch_dir)?;
+    std::fs::create_dir_all(&args.watch_dir).with_context(|| {
+        format!("cannot create watch directory {}", args.watch_dir.display())
+    })?;
     match args.listen {
         Some(socket) => syncer::listen(args.watch_dir, socket).await,
         None => syncer::run(args.watch_dir).await,

@@ -1,6 +1,7 @@
 mod beam;
 mod commands;
 mod config;
+mod paths;
 mod progress;
 mod syncer;
 mod transfer;

@@ -6,6 +6,22 @@ Each version links to its full commit range. Upgrading is just replacing the
 `beamup` binary: it deploys the matching agent to the beam itself. Entries
 call out when more than that is needed.
 
+## [v0.2.4] — 2026-11-20
+
+### Fixed
+
+- **`git status` on the beam no longer lists every file.** beamup doesn't
+  sync `.git/index`, because its format differs between platforms, so a repo
+  synced to a new beam had no index. git there then reported every tracked
+  file as both deleted and untracked: tens of thousands of lines for a large
+  repo. beamup now rebuilds the index from `HEAD` on the beam when the
+  initial sync finishes. Uncommitted local changes show as modified, and
+  anything you had staged locally shows as unstaged.
+
+  If you worked around this on an older version with `git reset --hard`,
+  note that it also discards uncommitted changes that beamup synced over.
+  Plain `git reset` rebuilds the index without touching your files.
+
 ## [v0.2.3] — 2026-11-20
 
 ### Added
@@ -214,6 +230,7 @@ direct IP needed. It deploys a small agent to the beam, embedded in the
 
 - Only aarch64 beams are supported. Fixed in v0.1.2.
 
+[v0.2.4]: https://github.com/webvictim/beamup/compare/v0.2.3...v0.2.4
 [v0.2.3]: https://github.com/webvictim/beamup/compare/v0.2.2...v0.2.3
 [v0.2.2]: https://github.com/webvictim/beamup/compare/v0.2.1...v0.2.2
 [v0.2.1]: https://github.com/webvictim/beamup/compare/v0.2.0...v0.2.1

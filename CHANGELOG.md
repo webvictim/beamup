@@ -6,6 +6,31 @@ Each version links to its full commit range. Upgrading is just replacing the
 `beamup` binary: it deploys the matching agent to the beam itself. Entries
 call out when more than that is needed.
 
+## [v0.2.3] — 2026-11-20
+
+### Added
+
+- **Beams download their agent instead of having it uploaded.** The first
+  sync to a beam has to get the agent there. Beams that can reach GitHub now
+  download it from the matching release, which takes about a second, instead
+  of waiting for your machine to send 3.8 MB. The beam checks the download
+  against a SHA-256 built into beamup before using it. If it can't reach
+  GitHub, beamup uploads the agent as before. Releases now include the agent
+  binaries (`beamup-agent-x86_64`, `beamup-agent-aarch64`) for this.
+
+### Changed
+
+- **Agent uploads are about 60% smaller.** When beamup does upload the agent,
+  it now compresses it: about 1.6 MB instead of 3.8 MB.
+
+### Fixed
+
+- **Re-syncing is fast again on current beams.** On beams whose `beamctl`
+  reports service status in lowercase, beamup didn't recognise its persistent
+  agent as running. Every session restarted it, losing the cached file hashes
+  that made v0.2.0's re-syncs about twice as fast. `beamup status` also
+  showed the agent as `failed` when it was running.
+
 ## [v0.2.2] — 2026-11-20
 
 ### Changed
@@ -189,6 +214,7 @@ direct IP needed. It deploys a small agent to the beam, embedded in the
 
 - Only aarch64 beams are supported. Fixed in v0.1.2.
 
+[v0.2.3]: https://github.com/webvictim/beamup/compare/v0.2.2...v0.2.3
 [v0.2.2]: https://github.com/webvictim/beamup/compare/v0.2.1...v0.2.2
 [v0.2.1]: https://github.com/webvictim/beamup/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/webvictim/beamup/compare/v0.1.2...v0.2.0

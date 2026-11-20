@@ -6,6 +6,19 @@ Each version links to its full commit range. Upgrading is just replacing the
 `beamup` binary: it deploys the matching agent to the beam itself. Entries
 call out when more than that is needed.
 
+## [v0.2.2] — 2026-11-20
+
+### Changed
+
+- **The progress bar moves during the initial sync.** It used to update only
+  when a whole batch of small files finished, so over a slow link it could
+  sit at 0 B for minutes before jumping to done. It now counts bytes as they
+  transfer.
+- **The "starting sync" line shows the sync direction.** It always printed
+  `↔`. It now shows `→` for local-to-beam, `←` for beam-to-local and `↔` for
+  both, with the initial direction in brackets when it differs from the
+  ongoing one.
+
 ## [v0.2.1] — 2026-11-10
 
 ### Added
@@ -176,6 +189,7 @@ direct IP needed. It deploys a small agent to the beam, embedded in the
 
 - Only aarch64 beams are supported. Fixed in v0.1.2.
 
+[v0.2.2]: https://github.com/webvictim/beamup/compare/v0.2.1...v0.2.2
 [v0.2.1]: https://github.com/webvictim/beamup/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/webvictim/beamup/compare/v0.1.2...v0.2.0
 [v0.1.2]: https://github.com/webvictim/beamup/compare/v0.1.1...v0.1.2

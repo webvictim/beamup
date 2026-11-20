@@ -1,0 +1,4 @@
+# cross runs build.rs in a container that doesn't inherit the host env.
+# BEAMUP_RELEASE marks official release builds (see .github/workflows/release.yml).
+[build.env]
+passthrough = ["BEAMUP_RELEASE"]

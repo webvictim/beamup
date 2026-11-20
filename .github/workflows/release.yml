@@ -112,7 +112,12 @@ jobs:
             cp "agent-bin/agent-${arch}/beamup-agent" "$dir/beamup-agent"
             chmod +x "$dir/beamup-agent"
           done
+      # Marks the build as an official release, so the CLI lets beams download
+      # the agents published below instead of uploading its embedded copy.
+      # Cross.toml passes it through into cross's build container.
       - name: Build CLI
+        env:
+          BEAMUP_RELEASE: "1"
         run: |
           if [ "${{ matrix.use-cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }} -p beamup-cli
@@ -136,14 +141,25 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      # Only the CLI binaries are release assets; the agent artifacts are an
-      # internal build input and are excluded here.
       - name: Download CLI artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: beamup-*
           merge-multiple: true
+      # The agents are published too: a beam with outbound access downloads the
+      # one its CLI embeds (checked against the SHA-256 embedded at build time)
+      # rather than having it uploaded over the user's link.
+      - name: Download agent artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: agent-bin
+          pattern: agent-*
+      - name: Stage agents as release assets
+        run: |
+          for arch in x86_64 aarch64; do
+            cp "agent-bin/agent-${arch}/beamup-agent" "artifacts/beamup-agent-${arch}"
+          done
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:

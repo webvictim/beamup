@@ -44,7 +44,7 @@ pub fn set_identity_file(path: Option<PathBuf>, proxy: Option<String>) {
 }
 
 /// Build a tsh Command with identity/proxy args prepended if configured.
-fn tsh_command() -> Command {
+pub(crate) fn tsh_command() -> Command {
     let mut cmd = Command::new("tsh");
     if let Some(Some(path)) = IDENTITY_FILE.get() {
         cmd.arg("-i").arg(path);
@@ -69,6 +69,14 @@ pub fn tsh_command_sync() -> std::process::Command {
 
 const EMBEDDED_AGENT_X86_64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/beamup-agent-x86_64"));
 const EMBEDDED_AGENT_AARCH64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/beamup-agent-aarch64"));
+// SHA-256 of each embedded agent, hex; empty when none is embedded.
+const EMBEDDED_AGENT_SHA256_X86_64: &str = include_str!(concat!(env!("OUT_DIR"), "/beamup-agent-x86_64.sha256"));
+const EMBEDDED_AGENT_SHA256_AARCH64: &str = include_str!(concat!(env!("OUT_DIR"), "/beamup-agent-aarch64.sha256"));
+
+/// Set by the release workflow, whose builds embed exactly the agents it publishes as
+/// release assets. Only then can a beam download its agent rather than be sent one.
+const RELEASE_BUILD: bool = option_env!("BEAMUP_RELEASE").is_some();
+const RELEASES_URL: &str = "https://github.com/webvictim/beamup/releases/download";
 
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -109,6 +117,13 @@ impl BeamArch {
             BeamArch::Aarch64 => EMBEDDED_AGENT_AARCH64,
         }
     }
+
+    fn embedded_sha256(&self) -> &'static str {
+        match self {
+            BeamArch::X86_64 => EMBEDDED_AGENT_SHA256_X86_64,
+            BeamArch::Aarch64 => EMBEDDED_AGENT_SHA256_AARCH64,
+        }
+    }
 }
 
 /// What one round trip to the beam tells us before deploying: its architecture, whether
@@ -119,6 +134,15 @@ pub struct BeamProbe {
     pub has_beamctl: bool,
     present_agents: Vec<String>,
     service: Option<ServiceInfo>,
+    /// Commands the agent deploy can use: `curl` and `sha256sum` to download it,
+    /// `gunzip` to receive it compressed.
+    tools: Vec<String>,
+}
+
+impl BeamProbe {
+    fn has_tool(&self, tool: &str) -> bool {
+        self.tools.iter().any(|t| t == tool)
+    }
 }
 
 /// The subset of `beamctl --json show` we care about.
@@ -154,6 +178,7 @@ impl BeamProbe {
         let mut has_beamctl = false;
         let mut present_agents = Vec::new();
         let mut service = None;
+        let mut tools = Vec::new();
         for line in output.lines() {
             let Some((key, value)) = line.trim().split_once('=') else {
                 continue;
@@ -162,13 +187,14 @@ impl BeamProbe {
                 "arch" => arch = Some(BeamArch::parse(value)?),
                 "beamctl" => has_beamctl = true,
                 "agent" => present_agents.push(value.to_string()),
+                "tool" => tools.push(value.to_string()),
                 // Empty when the service doesn't exist.
                 "service" if !value.is_empty() => service = serde_json::from_str(value).ok(),
                 _ => {}
             }
         }
         let arch = arch.ok_or_else(|| anyhow::anyhow!("beam probe did not report an architecture:\n{output}"))?;
-        Ok(Self { arch, has_beamctl, present_agents, service })
+        Ok(Self { arch, has_beamctl, present_agents, service, tools })
     }
 }
 
@@ -185,14 +211,15 @@ async fn probe_beam(beam_id: &str, remote_dir: &str) -> Result<BeamProbe> {
            echo beamctl=1; \
            echo service=$(beamctl --json show {service} 2>/dev/null | tr -d '\\n'); \
          fi; \
+         for t in curl sha256sum gunzip; do command -v $t >/dev/null 2>&1 && echo tool=$t; done; \
          for f in {}; do [ -x \"$f\" ] && echo agent=$f; done; true",
         candidates.join(" ")
     );
     let output = Beam::exec_shell_output(beam_id, &script).await?;
     let probe = BeamProbe::parse(&output)?;
     debug!(
-        "beam {beam_id}: arch {}, beamctl {}, agents present {:?}, service {:?}",
-        probe.arch.as_str(), probe.has_beamctl, probe.present_agents, probe.service
+        "beam {beam_id}: arch {}, beamctl {}, tools {:?}, agents present {:?}, service {:?}",
+        probe.arch.as_str(), probe.has_beamctl, probe.tools, probe.present_agents, probe.service
     );
     Ok(probe)
 }
@@ -298,6 +325,22 @@ impl AgentBinary {
             AgentBinary::Embedded(data) => hash_content(data),
         };
         Ok(format!("/tmp/beamup-agent-{hash:016x}"))
+    }
+
+    /// Where the beam can download this exact build itself, and the SHA-256 to check it
+    /// against. Only for the agents a release build embeds: an agent from a dev build or
+    /// an override path isn't published anywhere.
+    fn release_asset(&self, arch: BeamArch) -> Option<(String, &'static str)> {
+        let sha256 = arch.embedded_sha256().trim();
+        if !RELEASE_BUILD || sha256.is_empty() || !matches!(self, AgentBinary::Embedded(_)) {
+            return None;
+        }
+        let url = format!(
+            "{RELEASES_URL}/v{}/beamup-agent-{}",
+            env!("CARGO_PKG_VERSION"),
+            arch.as_str()
+        );
+        Some((url, sha256))
     }
 
     fn to_path(&self, arch: BeamArch) -> Result<PathBuf> {
@@ -419,8 +462,21 @@ impl Beam {
         if probe.present_agents.contains(&remote_path) {
             info!("agent already on beam");
         } else {
-            let agent_path = agent.to_path(arch)?;
-            crate::transfer::upload_agent(beam_id, &agent_path, &remote_path).await?;
+            // A beam with outbound access fetches a release's agent from GitHub much
+            // faster than most uplinks can send it. Anything else gets it uploaded.
+            let mut downloaded = false;
+            if let Some((url, sha256)) = agent.release_asset(arch) {
+                if probe.has_tool("curl") && probe.has_tool("sha256sum") {
+                    match crate::transfer::download_agent(beam_id, &url, sha256, &remote_path).await {
+                        Ok(()) => downloaded = true,
+                        Err(e) => info!("beam could not download the agent, uploading it instead: {e:#}"),
+                    }
+                }
+            }
+            if !downloaded {
+                let agent_path = agent.to_path(arch)?;
+                crate::transfer::upload_agent(beam_id, &agent_path, &remote_path, probe.has_tool("gunzip")).await?;
+            }
         }
         let _ = AGENT_REMOTE_PATH.set(remote_path.clone());
 
@@ -781,6 +837,31 @@ mod tests {
     #[test]
     fn probe_without_arch_is_an_error() {
         assert!(BeamProbe::parse("beamctl=1\n").is_err());
+    }
+
+    #[test]
+    fn probe_reports_download_tools() {
+        let probe = BeamProbe::parse("arch=x86_64\ntool=curl\ntool=gunzip\n").unwrap();
+        assert!(probe.has_tool("curl"));
+        assert!(probe.has_tool("gunzip"));
+        assert!(!probe.has_tool("sha256sum"));
+    }
+
+    #[test]
+    fn only_embedded_release_agents_are_downloadable() {
+        // Path overrides and dev-target agents are never published.
+        let path = AgentBinary::Path(PathBuf::from("/tmp/beamup-agent"));
+        assert!(path.release_asset(BeamArch::X86_64).is_none());
+
+        let embedded = AgentBinary::Embedded(b"agent");
+        let asset = embedded.release_asset(BeamArch::Aarch64);
+        if RELEASE_BUILD && !BeamArch::Aarch64.embedded_sha256().is_empty() {
+            let (url, sha256) = asset.unwrap();
+            assert!(url.ends_with(&format!("/v{}/beamup-agent-aarch64", env!("CARGO_PKG_VERSION"))));
+            assert_eq!(sha256.len(), 64);
+        } else {
+            assert!(asset.is_none());
+        }
     }
 
     #[test]

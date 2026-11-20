@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use sha2::{Digest, Sha256};
+
 /// Agent target triples we may embed, keyed by the `uname -m` value they run on.
 const AGENT_TARGETS: &[(&str, &str)] = &[
     ("x86_64", "x86_64-unknown-linux-musl"),
@@ -8,7 +10,14 @@ const AGENT_TARGETS: &[(&str, &str)] = &[
 
 fn main() {
     println!("cargo:rerun-if-env-changed=BEAMUP_AGENT_PATH");
+    println!("cargo:rerun-if-env-changed=BEAMUP_RELEASE");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // The release workflow sets this; the CLI then lets beams download their agent
+    // from the release, since it embeds exactly the agents published there.
+    if std::env::var("BEAMUP_RELEASE").is_ok_and(|v| v == "1") {
+        println!("cargo:rustc-env=BEAMUP_RELEASE=1");
+    }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let mut embedded = Vec::new();
@@ -17,18 +26,28 @@ fn main() {
         println!("cargo:rerun-if-env-changed=BEAMUP_AGENT_PATH_{}", arch.to_uppercase());
 
         let dest = out_dir.join(format!("beamup-agent-{arch}"));
+        // Checked by the beam against an agent it downloads, so it must be a
+        // cryptographic hash (the content-addressed path uses xxh3, which isn't).
+        let sha_dest = out_dir.join(format!("beamup-agent-{arch}.sha256"));
 
         match find_agent_binary(arch, target) {
             Some(path) => {
                 std::fs::copy(&path, &dest).expect("failed to copy agent binary to OUT_DIR");
                 println!("cargo:rerun-if-changed={}", path.display());
-                let len = std::fs::metadata(&dest).unwrap().len();
-                eprintln!("beamup build: embedding {arch} agent from {} ({len} bytes)", path.display());
+                let data = std::fs::read(&dest).unwrap();
+                let sha256: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+                std::fs::write(&sha_dest, &sha256).unwrap();
+                eprintln!(
+                    "beamup build: embedding {arch} agent from {} ({} bytes, sha256 {sha256})",
+                    path.display(),
+                    data.len()
+                );
                 embedded.push(*arch);
             }
             None => {
-                // Empty placeholder so include_bytes! still compiles.
+                // Empty placeholders so include_bytes!/include_str! still compile.
                 std::fs::write(&dest, b"").unwrap();
+                std::fs::write(&sha_dest, b"").unwrap();
                 eprintln!("beamup build: no {arch} agent found, embedding disabled for {arch}");
             }
         }

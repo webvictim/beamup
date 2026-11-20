@@ -107,6 +107,10 @@ tsh beams exec "$BEAM" -- make build
 
 On beams with `beamctl`, the agent stays running after a oneshot, so a later `beamup sync --oneshot --beam "$BEAM"` re-syncs quickly (see below).
 
+## Agent deployment
+
+The first sync to a beam needs the agent there. Release builds of beamup have the beam download it from the matching GitHub release, which is usually much faster than sending it over your uplink. The beam checks the download against the SHA-256 embedded in the CLI before using it. If the beam can't reach GitHub, lacks `curl` or `sha256sum`, or you're running a dev build, beamup uploads the agent gzipped instead (about 1.6 MB rather than 3.8 MB).
+
 ## Persistent agent
 
 When the beam has `beamctl` (beam-init's service manager), beamup runs the agent as a beamctl service, `beamup-<hash of remote path>`, labelled `app=beamup`. It keeps running between sessions, so reconnecting is much cheaper:

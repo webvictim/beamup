@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::beam::Beam;
+use crate::beam::{shell_quote, tsh_command, Beam};
 
 #[derive(Debug, Clone)]
 pub enum Direction {
@@ -751,41 +751,83 @@ async fn pull_file(
     Ok(())
 }
 
-/// Upload the agent binary to `remote_path` on the beam. It's staged under a unique
-/// name and moved into place, so a concurrent session never sees a partial binary and
-/// scp never has to overwrite an existing file.
-pub async fn upload_agent(beam_id: &str, agent_path: &Path, remote_path: &str) -> Result<()> {
-    let staging = format!("{remote_path}.{}.beamup-tmp", std::process::id());
+/// Staging name for an agent on its way to `remote_path`. Unique per process, so a
+/// concurrent session never sees a partial binary and nothing overwrites a file in use.
+fn agent_staging_path(remote_path: &str) -> String {
+    format!("{remote_path}.{}.beamup-tmp", std::process::id())
+}
+
+/// Upload the agent binary to `remote_path` on the beam, gzipped when the beam can
+/// unpack it: the agent compresses to well under half its size, and on a slow uplink
+/// this upload is most of the time a first sync spends deploying.
+pub async fn upload_agent(beam_id: &str, agent_path: &Path, remote_path: &str, gunzip: bool) -> Result<()> {
+    let staging = agent_staging_path(remote_path);
+    let q_staging = shell_quote(&staging);
+    let q_remote = shell_quote(remote_path);
     let size = agent_path.metadata()?.len();
 
-    if size <= 50 * 1024 * 1024 {
-        info!("deploying agent: {} bytes", size);
+    if !gunzip {
+        info!("deploying agent: {size} bytes (beam has no gunzip, sending uncompressed)");
         Beam::scp_to_beam(beam_id, agent_path, &staging).await?;
-        Beam::exec_shell(beam_id, &format!("chmod +x '{staging}' && mv -f '{staging}' '{remote_path}'")).await?;
-    } else {
-        use std::io::Write;
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-
-        let data = std::fs::read(agent_path)?;
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&data)?;
-        let compressed = encoder.finish()?;
-        let compressed_size = compressed.len();
-        let ratio = size as f64 / compressed_size as f64;
-        info!("deploying agent: {size} bytes -> {compressed_size} bytes compressed ({ratio:.1}x)");
-
-        let local_tmp = std::env::temp_dir().join("beamup-agent-deploy.gz");
-        std::fs::write(&local_tmp, &compressed)?;
-        Beam::scp_to_beam(beam_id, &local_tmp, &format!("{staging}.gz")).await?;
-        let _ = std::fs::remove_file(&local_tmp);
-        Beam::exec_shell(
-            beam_id,
-            &format!("gunzip -f '{staging}.gz' && chmod +x '{staging}' && mv -f '{staging}' '{remote_path}'"),
-        )
-        .await?;
+        Beam::exec_shell(beam_id, &format!("chmod +x {q_staging} && mv -f {q_staging} {q_remote}")).await?;
+        return Ok(());
     }
 
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let data = std::fs::read(agent_path)?;
+    // Level 6: within 1% of level 9 on the agent, in half the time.
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&data)?;
+    let compressed = encoder.finish()?;
+    info!("deploying agent: {size} bytes, {} compressed", compressed.len());
+
+    let local_tmp = std::env::temp_dir().join(format!("beamup-agent-deploy.{}.gz", std::process::id()));
+    std::fs::write(&local_tmp, &compressed)?;
+    let sent = Beam::scp_to_beam(beam_id, &local_tmp, &format!("{staging}.gz")).await;
+    let _ = std::fs::remove_file(&local_tmp);
+    sent?;
+    Beam::exec_shell(
+        beam_id,
+        &format!("gunzip -f {q_staging}.gz && chmod +x {q_staging} && mv -f {q_staging} {q_remote}"),
+    )
+    .await
+}
+
+/// Have the beam fetch the agent from `url` itself, check it against `sha256` and move
+/// it into place at `remote_path`. One attempt, no retries: this is the fast path, and
+/// a beam that can't reach the URL should fall back to an upload rather than wait.
+pub async fn download_agent(beam_id: &str, url: &str, sha256: &str, remote_path: &str) -> Result<()> {
+    let staging = shell_quote(&agent_staging_path(remote_path));
+    let script = format!(
+        "curl -fsSL --connect-timeout 5 --max-time 30 -o {staging} {url} \
+         && printf '%s  %s\\n' {sha256} {staging} | sha256sum -c --status \
+         && chmod +x {staging} && mv -f {staging} {remote} \
+         || {{ status=$?; rm -f {staging}; exit $status; }}",
+        url = shell_quote(url),
+        sha256 = shell_quote(sha256),
+        remote = shell_quote(remote_path),
+    );
+
+    info!("beam downloading agent from {url}");
+    let start = Instant::now();
+    let output = tsh_command()
+        .args(["beams", "exec", beam_id, "--", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "download or checksum failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    info!("agent downloaded by beam in {:.1}s", start.elapsed().as_secs_f64());
     Ok(())
 }
 

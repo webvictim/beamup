@@ -131,8 +131,19 @@ struct ServiceInfo {
 }
 
 impl ServiceInfo {
+    /// The status variant, lowercased. beamctl serialises it as `"Stopped"` or as an
+    /// object keyed by the variant (`{"Running": {...}}`), and newer beamctl versions
+    /// write the variant in lowercase, so match it either way.
+    fn state(&self) -> Option<String> {
+        match &self.status {
+            serde_json::Value::String(s) => Some(s.to_ascii_lowercase()),
+            serde_json::Value::Object(map) => map.keys().next().map(|k| k.to_ascii_lowercase()),
+            _ => None,
+        }
+    }
+
     fn is_running(&self) -> bool {
-        self.status.get("Running").is_some()
+        self.state().as_deref() == Some("running")
     }
 }
 
@@ -639,10 +650,10 @@ impl Beam {
         };
         let info: ServiceInfo =
             serde_json::from_str(&output[start..]).context("failed to parse beamctl show output")?;
-        Ok(match &info.status {
-            s if s.get("Running").is_some() => "running",
-            s if s.get("Exited").is_some() => "exited",
-            s if s.as_str() == Some("Stopped") => "stopped",
+        Ok(match info.state().as_deref() {
+            Some("running") => "running",
+            Some("exited") => "exited",
+            Some("stopped") => "stopped",
             _ => "failed",
         })
     }
@@ -753,6 +764,18 @@ mod tests {
         )
         .unwrap();
         assert!(!probe.service.unwrap().is_running());
+    }
+
+    #[test]
+    fn service_state_ignores_case() {
+        for status in [r#"{"Running":{"main_pid":1}}"#, r#"{"running":{"main_pid":1}}"#] {
+            let svc: ServiceInfo =
+                serde_json::from_str(&format!(r#"{{"cmd":"/a","args":[],"status":{status}}}"#)).unwrap();
+            assert!(svc.is_running(), "{status}");
+        }
+        let svc: ServiceInfo = serde_json::from_str(r#"{"cmd":"/a","status":"stopped"}"#).unwrap();
+        assert_eq!(svc.state().as_deref(), Some("stopped"));
+        assert!(!svc.is_running());
     }
 
     #[test]

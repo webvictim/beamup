@@ -354,7 +354,9 @@ async fn handle_message(
             }
         }
         Message::ManifestAck => {
-            // CLI finished initial sync — send our ack back
+            // CLI finished initial sync. Fix up the repo before acking, so a oneshot
+            // run doesn't exit until git on the beam works.
+            ensure_git_index(watch_dir).await;
             transport.send(Message::ManifestAck).await?;
             info!("initial sync complete");
         }
@@ -367,6 +369,44 @@ async fn handle_message(
         }
     }
     Ok(())
+}
+
+/// beamup never syncs `.git/index` (its format is platform-specific), so a repo synced
+/// to a fresh beam has none, and git there reports every file as both deleted and
+/// untracked. Rebuild it from HEAD. This uses read-tree and update-index rather than
+/// `git reset`, which would also write `.git/ORIG_HEAD` and sync it back over the
+/// local one; the index itself is never synced, so nothing goes back.
+async fn ensure_git_index(watch_dir: &Path) {
+    let git_dir = watch_dir.join(".git");
+    if !git_dir.is_dir() || git_dir.join("index").exists() {
+        return;
+    }
+    let git = |args: &'static [&'static str]| {
+        tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(watch_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+    };
+
+    match git(&["read-tree", "HEAD"]).await {
+        Ok(out) if out.status.success() => {}
+        // An unborn branch has no HEAD to read, and needs no index anyway.
+        Ok(out) => {
+            debug!("not rebuilding .git/index: {}", String::from_utf8_lossy(&out.stderr).trim());
+            return;
+        }
+        Err(e) => {
+            warn!("no .git/index on the beam and git isn't runnable ({e}); run `git reset` there");
+            return;
+        }
+    }
+    // Fills in the stat data so git status doesn't re-hash every file. Exits 1 when
+    // some files differ from HEAD, which is just local edits that synced over.
+    let _ = git(&["update-index", "-q", "--refresh"]).await;
+    info!("rebuilt .git/index from HEAD");
 }
 
 async fn handle_manifest(
@@ -733,6 +773,49 @@ mod tests {
 
     fn manifest_hash(entries: &[ManifestEntry], path: &str) -> u64 {
         entries.iter().find(|e| e.path == path).unwrap().hash
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rebuilds_missing_git_index_from_head() {
+        let dir = temp_dir("git-index");
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), b"one").unwrap();
+        std::fs::write(dir.join("b.txt"), b"two").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        // A local edit that synced over, and a beam with no index.
+        std::fs::write(dir.join("b.txt"), b"changed").unwrap();
+        std::fs::remove_file(dir.join(".git/index")).unwrap();
+
+        ensure_git_index(&dir).await;
+
+        assert_eq!(git(&dir, &["status", "--porcelain"]), " M b.txt\n");
+        assert!(!dir.join(".git/ORIG_HEAD").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn leaves_unborn_repo_and_existing_index_alone() {
+        let dir = temp_dir("git-unborn");
+        git(&dir, &["init", "-q"]);
+        ensure_git_index(&dir).await;
+        assert!(!dir.join(".git/index").exists());
+
+        std::fs::write(dir.join(".git/index"), b"not touched").unwrap();
+        ensure_git_index(&dir).await;
+        assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), b"not touched");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
